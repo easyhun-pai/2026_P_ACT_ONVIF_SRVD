@@ -1,0 +1,1647 @@
+/*
+ --------------------------------------------------------------------------
+ ServicePTZ.cpp - MK3 PTZ (basic)
+
+ upstream KoynovStas/onvif_srvd df09d0a 의 ServicePTZ.cpp를 MK3 하드웨어용으로 교체.
+ 현장 원본(md5 448443cd)과 같은 기능 범위로 재구성하고, 아래만 바꿨다.
+
+   1. 시작 시 R/S를 무조건 보내지 않는다.
+      축마다 값 없는 'T'로 상태를 조회해서
+        - 기동(arm) 상태  : 아무것도 보내지 않고 MCU 목표각을 현재 위치로 사용
+        - 미기동/판단불가 : 'S'만 보낸다 (R은 보내지 않음)
+      근거(2026-11-02 실측, v2.3.0-manual / v1.0.6 공통):
+        - 미기동이면 'T' 응답의 Sensor offset = 0.00, 기동이면 실제 오프셋
+        - Pi 재부팅 시 MCU는 기동 상태와 목표를 유지
+        - 기동 중 'S'를 다시 받아도 목표 유지 (0으로 튀지 않음)
+   2. 펌웨어 정보 CLI: onvif_srvd --mcu-info
+   3. 시리얼 포트 독점 (flock + TIOCEXCL)
+   4. 시작 시 MCU 목표각으로 위치 동기화 (position.txt 불일치 해소, 자동 이동 없음)
+   5. 모터 명령 이력 로그 ("PTZ-CMD:" 접두사, stderr -> journal)
+   6. 펌웨어가 한계각을 알려주면(v2.3.0 'I') 스펙 한계와 교집합으로 클램프
+
+ Pan/Tilt : /dev/ttyAMA0, /dev/ttyAMA2 (115200, 'T<rad>\n')
+ Zoom     : 192.168.1.68 ONVIF SOAP 직접 호출
+-----------------------------------------------------------------------------
+*/
+
+#include "soapPTZBindingService.h"
+#include "ServiceContext.h"
+#include "smacros.h"
+#include "stools.h"
+#include <curl/curl.h>
+#include <mosquitto.h>
+
+#include <string>
+#include <vector>
+#include <map>
+#include <mutex>
+#include <atomic>
+#include <thread>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <poll.h>
+#include <errno.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+
+#ifndef MK3_BUILD_INFO
+#define MK3_BUILD_INFO "mk3-basic (unknown build)"
+#endif
+
+// 항상 journal에 남기는 로그 (DEBUG_MSG는 release에서 꺼짐)
+#define PTZ_LOG(...)  do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while (0)
+
+// ===== 하드웨어 설정 =====
+static const char* PAN_PORT  = "/dev/ttyAMA0";
+static const char* TILT_PORT = "/dev/ttyAMA2";
+
+// 스펙 가동범위: pan ±135°, tilt 0~90°
+static const float SPEC_PAN_MIN  = -2.35619f, SPEC_PAN_MAX  = 2.35619f;
+static const float SPEC_TILT_MIN =  0.0f,     SPEC_TILT_MAX = 1.57080f;
+static float PAN_MIN  = SPEC_PAN_MIN,  PAN_MAX  = SPEC_PAN_MAX;
+static float TILT_MIN = SPEC_TILT_MIN, TILT_MAX = SPEC_TILT_MAX;
+static const float ZOOM_MIN = 0.0f, ZOOM_MAX = 1.0f;
+
+static const float REL_SCALE_PAN  = 0.5f;   // ONVIF 1.0 -> 0.5 rad
+static const float REL_SCALE_TILT = 0.3f;
+static const float REL_SCALE_ZOOM = 0.5f;
+
+// Continuous move: velocity 1.0일 때 20ms마다 이동하는 radian
+static const float CONT_STEP_PAN  = 0.032f;
+static const float CONT_STEP_TILT = 0.016f;
+static const int   CONT_INTERVAL_US = 20000;
+static const uint64_t CONT_TIMEOUT_US = 5000000;   // 5초 무명령 시 자동 정지
+
+// 시작 시 상태 판정
+static const float ARMED_ERR_RAD    = 0.15f;   // 기동 판정: |현재-목표| 허용 (틸트는 자중으로 ~0.07 처져서 유지)
+static const float OFFSET_ZERO_EPS  = 0.005f;  // 미기동이면 Sensor offset = 0.00
+static const int   QUERY_TIMEOUT_MS = 600;
+static const int   READY_TIMEOUT_MS = 4000;    // S 후 "Motor ready" 대기
+
+// 기동(arm) 방식 - 2026-11-02 결정
+//  - 콜드부팅 첫 시작은 부팅 후 ARM_DELAY_S(기본 30초, env PTZ_ARM_DELAY_S)까지 기다렸다가 기동
+//    (전원·PoE 협상이 안정된 뒤 모터를 켠다)
+//  - S 직후부터 HOLD_STREAM_MS 동안 '현재(처진) 자세'를 20ms마다 목표로 보낸다
+//    -> MCU가 Ready 되는 순간 목표가 현재 자세로 잡혀 0,0으로 끌어올리지 않는다 (ptz018 실측)
+//    (S 전에 보낸 T는 미기동 MCU가 무시한다 - 실측)
+//  - 기동이 꺼져도 자동 재시도하지 않는다. 감지해서 PTZ-ALERT 로그만 남긴다.
+static const int   ARM_DELAY_DEFAULT_S = 30;
+static const int   HOLD_STREAM_MS      = 3000;
+static const int   MONITOR_AFTER_ARM_S = 30;    // 기동 후 상태 기록 (1초 단위 로그)
+static const int   HEALTH_PERIOD_MS    = 500;   // 운영 중 상태 조회 주기 - 실시간 상태 파일 갱신(0.5초), 이상할 때만 로그
+static const float NOT_HOLDING_RAD     = 0.30f; // 정지 중 |현재-목표|가 이보다 크면 '유지 못함'
+
+// Zoom 카메라
+static const char* ZOOM_CAM_USERPWD = "admin:CHANGE_ME"   /* 실제 계정은 배포 시 설정 (공개본에서 제거) */;
+static const char* ZOOM_CAM_TOKEN   = "ONFProfileToken_101";
+static const char* ZOOM_CAM_URL     = "http://192.168.1.68/onvif/ptz_service";
+
+// 저장 위치
+static const char* PRESET_DB_DIR      = "/var/lib/onvif_srvd";
+static const char* PRESET_DB_PATH     = "/var/lib/onvif_srvd/presets.txt";
+static const char* POSITION_DB_PATH   = "/var/lib/onvif_srvd/position.txt";
+static const char* TRACKING_LOCK_PATH = "/var/lib/onvif_srvd/tracking_lock";
+static const char* MOUNT_MODE_PATH    = "/var/lib/onvif_srvd/mount_mode";
+static const char* OFFSET_DB_PATH     = "/var/lib/onvif_srvd/mcu_offset";   // 축별 Sensor offset (기동 중 읽은 값)
+static const char* RUN_DIR            = "/run/onvif_srvd";
+static const char* MCU_INFO_PATH      = "/run/onvif_srvd/mcu_info";
+static const char* LIVE_PATH          = "/run/onvif_srvd/live";      // 실시간 각도 (0.5초마다 갱신)
+static const char* STARTED_MARK_PATH  = "/run/onvif_srvd/started";   // 이번 부팅에서 한 번 시작했음 (tmpfs)
+// Pi 리셋 원인 (PM_RSTS). 실측: 콜드부팅 0x1000, sudo reboot 0x1020 -> 0x20 비트 = 소프트웨어 리셋
+static const char* RSTS_PATH          = "/proc/device-tree/chosen/bootloader/rsts";
+static const unsigned RSTS_SOFT_RESET = 0x20;
+
+// ===== 유틸 =====
+static inline float clampf(float v, float lo, float hi) { return std::max(lo, std::min(hi, v)); }
+static const float TWO_PI_F = 6.28318530718f;
+static inline float wrapd(float x) { return remainderf(x, TWO_PI_F); }   // -> [-π, +π]
+
+static uint64_t now_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+}
+
+static std::string now_str() {
+    char b[32];
+    time_t t = time(nullptr);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tmv);
+    return b;
+}
+
+static void ensure_dir(const char* d) {
+    struct stat st{};
+    if (stat(d, &st) != 0) mkdir(d, 0755);
+}
+
+static bool is_tracking_locked() {
+    struct stat st{};
+    return (stat(TRACKING_LOCK_PATH, &st) == 0);
+}
+
+static bool is_hang_mode() {
+    std::ifstream f(MOUNT_MODE_PATH);
+    if (!f.is_open()) return false;
+    std::string mode;
+    f >> mode;
+    return (mode == "hang");
+}
+
+// ===== 현재 각도(명령 기준) =====
+static std::mutex g_pose_mtx;
+static float g_cur_pan  = 0.0f;
+static float g_cur_tilt = 0.0f;
+static float g_cur_zoom = 0.0f;
+
+static void set_current_pt(float pan, float tilt) {
+    std::lock_guard<std::mutex> lk(g_pose_mtx);
+    g_cur_pan  = clampf(pan,  PAN_MIN,  PAN_MAX);
+    g_cur_tilt = clampf(tilt, TILT_MIN, TILT_MAX);
+}
+static void get_current_pt(float& pan, float& tilt) {
+    std::lock_guard<std::mutex> lk(g_pose_mtx);
+    pan = g_cur_pan; tilt = g_cur_tilt;
+}
+static void adjust_current_pt(float dpan, float dtilt) {
+    std::lock_guard<std::mutex> lk(g_pose_mtx);
+    g_cur_pan  = clampf(g_cur_pan  + dpan,  PAN_MIN,  PAN_MAX);
+    g_cur_tilt = clampf(g_cur_tilt + dtilt, TILT_MIN, TILT_MAX);
+}
+static void set_current_zoom(float zoom) {
+    std::lock_guard<std::mutex> lk(g_pose_mtx);
+    g_cur_zoom = clampf(zoom, ZOOM_MIN, ZOOM_MAX);
+}
+static float get_current_zoom() {
+    std::lock_guard<std::mutex> lk(g_pose_mtx);
+    return g_cur_zoom;
+}
+static void adjust_current_zoom(float dzoom) {
+    std::lock_guard<std::mutex> lk(g_pose_mtx);
+    g_cur_zoom = clampf(g_cur_zoom + dzoom, ZOOM_MIN, ZOOM_MAX);
+}
+
+// ===== 위치 저장/로드 =====
+static void save_position_to_file() {
+    ensure_dir(PRESET_DB_DIR);
+    float sp, stv, sz;
+    {
+        std::lock_guard<std::mutex> lk(g_pose_mtx);
+        sp = g_cur_pan; stv = g_cur_tilt; sz = g_cur_zoom;
+    }
+    std::ofstream fout(POSITION_DB_PATH, std::ios::trunc);
+    if (!fout.is_open()) return;
+    fout << sp << " " << stv << " " << sz << std::endl;
+    DEBUG_MSG("PTZ: saved pan=%.4f tilt=%.4f zoom=%.2f\n", sp, stv, sz);
+}
+
+static bool load_position_from_file(float& pan, float& tilt, float& zoom) {
+    std::ifstream fin(POSITION_DB_PATH);
+    if (!fin.is_open()) return false;
+    return (bool)(fin >> pan >> tilt >> zoom);
+}
+
+// ===== MQTT 텔레메트리 =====
+static struct mosquitto* g_mosq = nullptr;
+static char g_mqtt_topic[128] = {0};
+static uint64_t g_mqtt_last_pub_us = 0;
+static const uint64_t MQTT_THROTTLE_US = 100000;   // 100ms
+
+static void mqtt_init() {
+    std::string device_id = "unknown";
+    std::ifstream fdev("/var/lib/onvif_srvd/device_id");
+    if (fdev.is_open()) std::getline(fdev, device_id);
+    const char* broker = getenv("MQTT_BROKER");
+    if (!broker) broker = "<platform-broker-ip>";
+
+    mosquitto_lib_init();
+    g_mosq = mosquitto_new(("onvif-" + device_id).c_str(), true, NULL);
+    if (!g_mosq) { PTZ_LOG("PTZ: mosquitto_new failed\n"); return; }
+    mosquitto_connect_async(g_mosq, broker, 1883, 60);
+    mosquitto_loop_start(g_mosq);
+    snprintf(g_mqtt_topic, sizeof(g_mqtt_topic), "telemetry/%s/ptz", device_id.c_str());
+    PTZ_LOG("PTZ: MQTT %s topic=%s\n", broker, g_mqtt_topic);
+}
+
+static void mqtt_publish_pose() {
+    if (!g_mosq || g_mqtt_topic[0] == '\0') return;
+    uint64_t now = now_us();
+    if (now - g_mqtt_last_pub_us < MQTT_THROTTLE_US) return;
+    g_mqtt_last_pub_us = now;
+
+    float pan, tilt;
+    get_current_pt(pan, tilt);
+    float zoom = get_current_zoom();
+    bool hang = is_hang_mode();
+    float pub_tilt = hang ? -tilt : tilt;   // hang 모드: tilt만 반전
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"pan\":%.6f,\"tilt\":%.6f,\"zoom\":%.3f,\"pan_deg\":%.1f,\"tilt_deg\":%.1f,\"mount\":\"%s\",\"ts\":%ld}",
+        pan, pub_tilt, zoom, pan * 57.2958f, pub_tilt * 57.2958f, hang ? "hang" : "stand", (long)time(NULL));
+    mosquitto_publish(g_mosq, NULL, g_mqtt_topic, strlen(buf), buf, 0, false);
+}
+
+// ===== 시리얼 =====
+struct AxisInfo {
+    const char* name;
+    const char* port;
+    int   fd = -1;
+    std::string version;          // V 응답
+    std::vector<std::string> info;// I 응답 (지원 펌웨어만)
+    bool  have_fw_lim = false;
+    float fw_min = 0, fw_max = 0;
+    bool  state_ok = false;       // T 응답 파싱 성공
+    float tgt = 0, cur = 0, off = 0;
+    int   off_known = 0;
+    bool  armed = false;
+    bool  force_s = false;        // 콜드부팅 첫 시작: 판정 없이 S
+    bool  hold_ok = false;        // S 직후 유지할 현재 자세
+    float hold = 0;
+    std::string state_before;     // 시작 시 판정 당시 상태
+    std::string action;           // 시작 시 한 일
+    float start_target = 0;       // 시작 후 MCU 목표각
+    bool  start_target_ok = false;
+    AxisInfo(const char* n, const char* p) : name(n), port(p) {}
+};
+static AxisInfo g_ax[2] = { AxisInfo("pan", PAN_PORT), AxisInfo("tilt", TILT_PORT) };
+static std::string g_boot_desc = "unknown";
+static std::mutex g_serial_wr_mtx;
+
+// 포트 열기. 다른 프로세스가 잡고 있으면 -2.
+static int open_serial_port(const char* port, bool lock) {
+    int fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) {
+        if (errno == EBUSY) return -2;   // TIOCEXCL로 다른 프로세스가 잡고 있음
+        PTZ_LOG("PTZ: failed to open %s: %s\n", port, strerror(errno));
+        return -1;
+    }
+    if (lock) {
+        if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); return -2; }
+        ioctl(fd, TIOCEXCL);   // root가 아닌 다른 프로세스의 open 차단
+    }
+    struct termios tio{};
+    cfmakeraw(&tio);
+    cfsetispeed(&tio, B115200);
+    cfsetospeed(&tio, B115200);
+    tio.c_cflag |= (CLOCAL | CREAD);
+    tio.c_cflag &= ~(CSIZE | PARENB | CSTOPB | HUPCL);
+    tio.c_cflag |= CS8;
+    tio.c_cc[VMIN]  = 0;
+    tio.c_cc[VTIME] = 0;
+    tcsetattr(fd, TCSANOW, &tio);
+    tcflush(fd, TCIOFLUSH);
+    return fd;
+}
+
+static void serial_write(int fd, const char* buf) {
+    if (fd < 0) return;
+    std::lock_guard<std::mutex> lk(g_serial_wr_mtx);
+    size_t len = strlen(buf), done = 0;
+    for (int tries = 0; done < len && tries < 50; ++tries) {
+        ssize_t n = write(fd, buf + done, len - done);
+        if (n > 0) done += (size_t)n;
+        else if (n < 0 && errno != EAGAIN && errno != EINTR) break;
+        else usleep(1000);
+    }
+    tcdrain(fd);
+}
+
+// 응답 줄을 모은다 (보내지는 않음). until이 포함된 줄을 받으면 바로 끝낸다.
+static std::vector<std::string> serial_read_lines(int fd, const char* until, int timeout_ms) {
+    std::vector<std::string> lines;
+    if (fd < 0) return lines;
+    std::string part;
+    uint64_t end = now_us() + (uint64_t)timeout_ms * 1000ULL;
+    while (now_us() < end) {
+        struct pollfd p = { fd, POLLIN, 0 };
+        int left = (int)((end - now_us()) / 1000ULL);
+        if (poll(&p, 1, std::max(1, left)) <= 0) continue;
+        char b[256];
+        ssize_t n = read(fd, b, sizeof(b));
+        if (n <= 0) continue;
+        part.append(b, (size_t)n);
+        size_t pos;
+        bool hit = false;
+        while ((pos = part.find('\n')) != std::string::npos) {
+            std::string l = part.substr(0, pos);
+            part.erase(0, pos + 1);
+            while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+            if (l.empty()) continue;
+            lines.push_back(l);
+            if (until && l.find(until) != std::string::npos) hit = true;
+        }
+        if (hit) break;
+    }
+    return lines;
+}
+
+// cmd를 보내고 응답 줄을 모은다.
+static std::vector<std::string> serial_query(int fd, const char* cmd, const char* until, int timeout_ms) {
+    if (fd < 0) return std::vector<std::string>();
+    tcflush(fd, TCIFLUSH);
+    std::string c = std::string(cmd) + "\n";
+    serial_write(fd, c.c_str());
+    return serial_read_lines(fd, until, timeout_ms);
+}
+
+// 조회용: 응답이 없으면 한 번 더 (포트를 막 연 직후 첫 명령이 유실되는 경우가 있음)
+static std::vector<std::string> serial_ask(int fd, const char* cmd, const char* until, int timeout_ms) {
+    std::vector<std::string> r = serial_query(fd, cmd, until, timeout_ms);
+    if (r.empty()) r = serial_query(fd, cmd, until, timeout_ms);
+    return r;
+}
+
+static std::string find_line(const std::vector<std::string>& v, const char* key) {
+    for (const auto& l : v) if (l.find(key) != std::string::npos) return l;
+    return "";
+}
+
+// 'T' 응답: "Target angle: a, Current angle: b, Sensor offset: c"
+static void query_state(AxisInfo& a) {
+    a.state_ok = false; a.off_known = 0;
+    std::vector<std::string> r = serial_ask(a.fd, "T", "Target angle", QUERY_TIMEOUT_MS);
+    std::string l = find_line(r, "Target angle");
+    if (l.empty()) return;
+    float t = 0, c = 0, o = 0;
+    int n = sscanf(l.c_str() + l.find("Target angle"),
+                   "Target angle: %f, Current angle: %f, Sensor offset: %f", &t, &c, &o);
+    if (n >= 2) { a.state_ok = true; a.tgt = t; a.cur = c; }
+    if (n >= 3) { a.off = o; a.off_known = 1; }
+}
+
+static void query_version(AxisInfo& a) {
+    std::vector<std::string> r = serial_ask(a.fd, "V", nullptr, 300);
+    a.version.clear();
+    for (const auto& l : r) if (!l.empty() && l[0] == 'v') { a.version = l; break; }
+}
+
+// 주의: v2.3.0은 'I'를 받으면 미기동 상태에서도 Sensor offset을 채운다 (11/02 실측).
+//       그래서 'I'는 반드시 상태 판정('T') 뒤에만 보낸다.
+static void query_info(AxisInfo& a) {
+    a.info.clear();
+    a.have_fw_lim = false;
+    if (a.version.compare(0, 2, "v2") == 0) {   // v2.x: 'I' 지원 (v1.0.6은 미지원)
+        a.info = serial_ask(a.fd, "I", "Current Sensor Angle", QUERY_TIMEOUT_MS);
+        float mn = 0, mx = 0;
+        std::string lmin = find_line(a.info, "Min Angle:"), lmax = find_line(a.info, "Max Angle:");
+        if (!lmin.empty() && !lmax.empty() &&
+            sscanf(lmin.c_str() + lmin.find("Min Angle:"), "Min Angle: %f", &mn) == 1 &&
+            sscanf(lmax.c_str() + lmax.find("Max Angle:"), "Max Angle: %f", &mx) == 1 && mn < mx) {
+            a.have_fw_lim = true; a.fw_min = mn; a.fw_max = mx;
+        }
+    }
+}
+
+static bool judge_armed(const AxisInfo& a) {
+    return a.state_ok && a.off_known && fabsf(a.off) > OFFSET_ZERO_EPS &&
+           fabsf(wrapd(a.cur - a.tgt)) < ARMED_ERR_RAD;
+}
+
+static std::string state_str(const AxisInfo& a) {
+    if (!a.state_ok) return "unknown (no 'T' reply)";
+    char b[160];
+    // offset이 있으면 current는 각도(바퀴 누적 가능) -> 한 바퀴 안으로 접어서, 원래 값도 같이 표시
+    bool angle = a.off_known && fabsf(a.off) > OFFSET_ZERO_EPS;
+    char cur[64];
+    if (angle && fabsf(wrapd(a.cur) - a.cur) > 0.01f) snprintf(cur, sizeof(cur), "%.2f [raw %.2f]", wrapd(a.cur), a.cur);
+    else snprintf(cur, sizeof(cur), "%.2f", a.cur);
+    snprintf(b, sizeof(b), "%s (target %.2f, current %s, offset %s)",
+             judge_armed(a) ? "armed" : "not armed", a.tgt, cur,
+             a.off_known ? std::to_string(a.off).substr(0, 5).c_str() : "?");
+    return b;
+}
+
+static std::string mcu_report(bool from_daemon) {
+    std::ostringstream o;
+    o << "time:  " << now_str() << "\n";
+    o << "build: " << MK3_BUILD_INFO << "\n";
+    o << "source: " << (from_daemon ? "onvif_srvd start-up" : "direct query (onvif_srvd not holding ports)") << "\n";
+    if (from_daemon) o << "boot:  " << g_boot_desc << "\n";
+    for (int i = 0; i < 2; ++i) {
+        const AxisInfo& a = g_ax[i];
+        o << "\n[" << a.name << "] " << a.port << "\n";
+        if (a.fd == -2)      { o << "  port busy (held by another process)\n"; continue; }
+        if (a.fd < 0 && !from_daemon) { o << "  port open failed\n"; continue; }
+        o << "  firmware: " << (a.version.empty() ? "(no reply)" : a.version) << "\n";
+        o << "  state:    " << (from_daemon ? a.state_before : state_str(a)) << "\n";
+        if (from_daemon) {
+            o << "  action:   " << (a.action.empty() ? std::string("(arming pending)") : a.action) << "\n";
+            if (a.start_target_ok) o << "  target after start: " << a.start_target << " rad\n";
+        }
+        if (a.have_fw_lim) o << "  fw limits: " << a.fw_min << " .. " << a.fw_max << " rad\n";
+        for (const auto& l : a.info) if (l.find("===") == std::string::npos) o << "  | " << l << "\n";
+    }
+    o << "\nlimits in use: pan " << PAN_MIN << " .. " << PAN_MAX
+      << ", tilt " << TILT_MIN << " .. " << TILT_MAX << " rad\n";
+    return o.str();
+}
+
+static void write_mcu_info() {
+    ensure_dir(RUN_DIR);
+    std::string tmp = std::string(MCU_INFO_PATH) + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f.is_open()) return;
+        f << mcu_report(true);
+    }
+    chmod(tmp.c_str(), 0644);   // 데몬 umask가 0이라 명시
+    rename(tmp.c_str(), MCU_INFO_PATH);
+}
+
+// ===== Pan/Tilt 전송 =====
+static std::atomic<float>    g_sent[2];               // 마지막으로 보낸 목표 (램프 시작점)
+static std::atomic<uint32_t> g_goto_gen{0};           // 새 명령이 진행 중 램프를 취소
+static std::atomic<bool>     g_motion_enabled{false}; // 기동이 끝나기 전엔 이동 명령을 MCU로 보내지 않는다
+static std::atomic<uint64_t> g_last_move_us{0};       // 마지막 이동 T 전송 시각
+// 기동 전에 들어온 단발 이동(절대/프리셋/홈/상대) - 기동 후 실행
+static std::mutex g_pending_mtx;
+static bool  g_pending = false;
+static float g_pending_pan = 0, g_pending_tilt = 0;
+
+static void send_axis_T(int i, float v) {
+    if (!g_motion_enabled.load()) return;
+    char b[32];
+    snprintf(b, sizeof(b), "T%.4f\n", v);
+    serial_write(g_ax[i].fd, b);
+    g_sent[i].store(v);
+    g_last_move_us.store(now_us());
+}
+
+static void send_serial_pt() {
+    float pan, tilt;
+    get_current_pt(pan, tilt);
+    send_axis_T(0, pan);
+    send_axis_T(1, tilt);
+    DEBUG_MSG("PTZ[MOVE]: pan=%.4f tilt=%.4f\n", pan, tilt);
+}
+
+// 단발 이동은 작은 T를 연속으로 보낸다 (이 MCU는 큰 단발 T보다 연속 T에 확실히 반응)
+// 기본 속도: 팬 1.6 rad/s, 틸트 0.8 rad/s (CONT_STEP / 20ms).
+// AbsoluteMove에 Speed(0~1)가 오면 그 비율로: 1.0 = 팬 3.0 rad/s, 틸트 1.5 rad/s (펌웨어 velocity limit 3.0)
+static const float GOTO_MAX_STEP_PAN  = 0.060f;
+static const float GOTO_MAX_STEP_TILT = 0.030f;
+static void goto_ramp_thread_func(uint32_t gen, float sp, float st) {
+    float tp, tt;
+    get_current_pt(tp, tt);
+    float p = g_sent[0].load(), t = g_sent[1].load();
+    for (int it = 0; it < 1000; ++it) {
+        if (g_goto_gen.load() != gen) return;
+        bool dp = fabsf(tp - p) <= sp;
+        bool dt = fabsf(tt - t) <= st;
+        p = dp ? tp : p + (tp > p ? sp : -sp);
+        t = dt ? tt : t + (tt > t ? st : -st);
+        send_axis_T(0, p);
+        send_axis_T(1, t);
+        if (dp && dt) return;
+        usleep(CONT_INTERVAL_US);
+    }
+}
+
+static void goto_current_pt(float speed = -1.0f);
+static void goto_current_pt(float speed) {
+    if (!g_motion_enabled.load()) {
+        float p, t;
+        get_current_pt(p, t);
+        { std::lock_guard<std::mutex> lk(g_pending_mtx); g_pending = true; g_pending_pan = p; g_pending_tilt = t; }
+        PTZ_LOG("PTZ: move to (%.3f, %.3f) requested before motors are armed - will run after arming\n", p, t);
+        return;
+    }
+    uint32_t gen = g_goto_gen.fetch_add(1) + 1;
+    float sp = CONT_STEP_PAN, st = CONT_STEP_TILT;
+    if (speed > 0.0f) {
+        float s = clampf(speed, 0.05f, 1.0f);
+        sp = GOTO_MAX_STEP_PAN * s;
+        st = GOTO_MAX_STEP_TILT * s;
+    }
+    std::thread(goto_ramp_thread_func, gen, sp, st).detach();
+    save_position_to_file();
+    mqtt_publish_pose();
+}
+
+// ===== Continuous move =====
+static std::atomic<float> g_cont_pan_vel{0.0f};
+static std::atomic<float> g_cont_tilt_vel{0.0f};
+static std::atomic<uint64_t> g_cont_last_cmd_us{0};
+
+static void continuous_move_thread_func() {
+    uint64_t last_ignore_log = 0;
+    while (true) {
+        float vx = g_cont_pan_vel.load();
+        float vy = g_cont_tilt_vel.load();
+        if (fabsf(vx) >= 0.01f || fabsf(vy) >= 0.01f) {
+            uint64_t elapsed = now_us() - g_cont_last_cmd_us.load();
+            if (elapsed > CONT_TIMEOUT_US) {
+                g_cont_pan_vel.store(0.0f);
+                g_cont_tilt_vel.store(0.0f);
+                save_position_to_file();
+                PTZ_LOG("PTZ: continuous auto-stop (no command for %.1fs)\n", elapsed / 1e6);
+            } else if (!g_motion_enabled.load()) {
+                uint64_t n = now_us();
+                if (n - last_ignore_log > 5000000ULL) {
+                    PTZ_LOG("PTZ: continuous move ignored - motors not armed yet\n");
+                    last_ignore_log = n;
+                }
+            } else {
+                float tsign = is_hang_mode() ? -1.0f : 1.0f;
+                g_goto_gen.fetch_add(1);   // 진행 중 단발 램프 취소
+                adjust_current_pt(vx * CONT_STEP_PAN, vy * tsign * CONT_STEP_TILT);
+                send_serial_pt();
+                mqtt_publish_pose();
+            }
+        }
+        usleep(CONT_INTERVAL_US);
+    }
+}
+
+// ===== 시리얼 수신 (시작 조회가 끝난 뒤 모든 수신은 이 스레드가 맡는다) =====
+struct Telem {
+    std::atomic<float>    tgt{0}, cur{0}, off{0};
+    std::atomic<uint64_t> us{0};
+};
+static Telem g_tel[2];
+static std::atomic<uint64_t> g_s_sent_us[2];   // 우리가 S를 보낸 시각 (직후 MOT 메시지는 정상)
+
+static void handle_mcu_line(int i, const std::string& l) {
+    const char* nm = g_ax[i].name;
+    size_t p = l.find("Target angle");
+    if (p != std::string::npos) {
+        float t = 0, c = 0, o = 0;
+        int n = sscanf(l.c_str() + p, "Target angle: %f, Current angle: %f, Sensor offset: %f", &t, &c, &o);
+        if (n >= 3) {
+            g_tel[i].tgt.store(t); g_tel[i].cur.store(c); g_tel[i].off.store(o);
+            g_tel[i].us.store(now_us());
+        }
+        return;
+    }
+    bool after_our_s = now_us() - g_s_sent_us[i].load() < 6000000ULL;
+    if (l.find("Firmware Version") != std::string::npos) {
+        // 우리는 R을 보내지 않는다 -> 이 배너는 MCU가 스스로 재부팅했다는 뜻 (전원 저하 등)
+        PTZ_LOG("PTZ-ALERT: %s MCU rebooted by itself (\"%s\") - motor is OFF now; not retrying\n", nm, l.c_str());
+        return;
+    }
+    if (l.compare(0, 4, "MOT:") == 0 || l.find("Motor ready") != std::string::npos) {
+        if (after_our_s) PTZ_LOG("PTZ-MCU: %s %s\n", nm, l.c_str());
+        else PTZ_LOG("PTZ-ALERT: %s MCU message without our S: %s\n", nm, l.c_str());
+    }
+}
+
+static void serial_reader_thread_func() {
+    std::string part[2];
+    while (true) {
+        struct pollfd pf[2];
+        int map[2], n = 0;
+        for (int i = 0; i < 2; ++i) if (g_ax[i].fd >= 0) { pf[n] = { g_ax[i].fd, POLLIN, 0 }; map[n++] = i; }
+        if (n == 0) return;
+        if (poll(pf, n, 500) <= 0) continue;
+        for (int k = 0; k < n; ++k) {
+            if (!(pf[k].revents & POLLIN)) continue;
+            int i = map[k];
+            char b[512];
+            ssize_t r = read(g_ax[i].fd, b, sizeof(b));
+            if (r <= 0) continue;
+            part[i].append(b, (size_t)r);
+            size_t pos;
+            while ((pos = part[i].find('\n')) != std::string::npos) {
+                std::string l = part[i].substr(0, pos);
+                part[i].erase(0, pos + 1);
+                while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+                if (!l.empty()) handle_mcu_line(i, l);
+            }
+            if (part[i].size() > 4096) part[i].clear();
+        }
+    }
+}
+
+// 수신 스레드가 도는 중의 상태 조회 ('T' 전송 -> 새 응답을 기다림)
+static bool tel_query(int i, float& t, float& c, float& o, int timeout_ms = 500) {
+    if (g_ax[i].fd < 0) return false;
+    uint64_t t0 = now_us();
+    serial_write(g_ax[i].fd, "T\n");
+    while (now_us() - t0 < (uint64_t)timeout_ms * 1000ULL) {
+        if (g_tel[i].us.load() > t0) {
+            t = g_tel[i].tgt.load(); c = g_tel[i].cur.load(); o = g_tel[i].off.load();
+            return true;
+        }
+        usleep(10000);
+    }
+    return false;
+}
+
+// ===== 축별 offset 기억 (콜드부팅 때 처진 자세 각도 계산용) =====
+static bool  g_stored_off_ok[2] = { false, false };
+static float g_stored_off[2]    = { 0, 0 };
+
+static void load_offsets() {
+    std::ifstream f(OFFSET_DB_PATH);
+    std::string nm; float v;
+    while (f >> nm >> v) {
+        for (int i = 0; i < 2; ++i)
+            if (nm == g_ax[i].name && fabsf(v) > OFFSET_ZERO_EPS) { g_stored_off[i] = v; g_stored_off_ok[i] = true; }
+    }
+}
+
+static void save_offsets_if_changed(const float off[2], const bool ok[2]) {
+    bool changed = false;
+    for (int i = 0; i < 2; ++i)
+        if (ok[i] && fabsf(off[i]) > OFFSET_ZERO_EPS && (!g_stored_off_ok[i] || fabsf(off[i] - g_stored_off[i]) > 0.005f)) {
+            g_stored_off[i] = off[i]; g_stored_off_ok[i] = true; changed = true;
+        }
+    if (!changed) return;
+    ensure_dir(PRESET_DB_DIR);
+    std::ofstream f(OFFSET_DB_PATH, std::ios::trunc);
+    for (int i = 0; i < 2; ++i) if (g_stored_off_ok[i]) f << g_ax[i].name << " " << g_stored_off[i] << "\n";
+    PTZ_LOG("PTZ: saved sensor offsets to %s\n", OFFSET_DB_PATH);
+}
+
+// ===== 시작 =====
+
+// 이번 시작이 '콜드부팅 후 첫 시작'인지. 그렇다면 MCU도 막 전원이 들어온 것이므로 판정 없이 S.
+// (실측: 콜드부팅 직후 v2.3.0 pan이 미기동인데 offset이 채워져 있던 경우가 있어 offset만으로는 불충분)
+static bool is_first_start_after_cold_boot() {
+    struct stat st{};
+    bool first = (stat(STARTED_MARK_PATH, &st) != 0);
+    unsigned rsts = 0;
+    bool have_rsts = false;
+    FILE* f = fopen(RSTS_PATH, "rb");
+    if (f) {
+        unsigned char b[4];
+        if (fread(b, 1, 4, f) == 4) { rsts = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]; have_rsts = true; }
+        fclose(f);
+    }
+    char d[128];
+    if (!have_rsts)
+        snprintf(d, sizeof(d), "reset reason unknown, %s start this boot", first ? "first" : "repeat");
+    else
+        snprintf(d, sizeof(d), "%s (rsts=0x%x), %s start this boot",
+                 (rsts & RSTS_SOFT_RESET) ? "reboot" : "power-on", rsts, first ? "first" : "repeat");
+    g_boot_desc = d;
+    return first && have_rsts && !(rsts & RSTS_SOFT_RESET);
+}
+
+static double uptime_s() {
+    double u = 0;
+    FILE* f = fopen("/proc/uptime", "r");
+    if (f) { if (fscanf(f, "%lf", &u) != 1) u = 0; fclose(f); }
+    return u;
+}
+
+// 축 하나 판정: V -> T(판정) -> I(설정; 'I'는 반드시 T 뒤). S가 필요하면 true.
+static bool decide_axis(AxisInfo& a) {
+    query_version(a);
+    query_state(a);
+    a.state_before = state_str(a);
+    PTZ_LOG("PTZ: %s firmware=%s state=%s\n", a.name,
+            a.version.empty() ? "(no reply)" : a.version.c_str(), a.state_before.c_str());
+    query_info(a);
+    if (!a.force_s && judge_armed(a)) {
+        a.action = "none (already armed - no command sent)";
+        PTZ_LOG("PTZ-CMD: %s none - already armed, keep target %.3f\n", a.name, a.tgt);
+        return false;
+    }
+    return true;
+}
+
+// 미기동 축을 '현재 자세 그대로' 켜기 위한 각도. 계산할 수 없으면 false (-> S 후 MCU 기본 목표 0으로 감)
+static bool compute_hold(int i, AxisInfo& a, float lo, float hi) {
+    if (!a.state_ok) return false;
+    float ang;
+    const char* src = "";
+    // MCU의 Current angle은 바퀴 수가 누적된 값일 수 있다 (실측: 실제 +108°인데 -4.40 = 1.88-2π).
+    // 목표(T)는 한 바퀴 안 값으로 다루므로 [-π, π]로 접어서 쓴다.
+    if (a.off_known && fabsf(a.off) > OFFSET_ZERO_EPS) { ang = wrapd(a.cur); src = "reported angle"; }
+    else {
+        float off = 0; bool ok = false;
+        if (g_stored_off_ok[i]) { off = g_stored_off[i]; ok = true; src = "stored offset"; }
+        else {
+            std::string l = find_line(a.info, "Sensor Offset:");
+            if (!l.empty() && sscanf(l.c_str() + l.find("Sensor Offset:"), "Sensor Offset: %f", &off) == 1 &&
+                fabsf(off) > OFFSET_ZERO_EPS) { ok = true; src = "offset from 'I'"; }
+        }
+        if (!ok) return false;
+        ang = wrapd(a.cur - off);
+    }
+    if (ang < lo - 0.20f || ang > hi + 0.20f) {
+        PTZ_LOG("PTZ: %s hold angle %.3f (%s) is outside limits - not holding\n", a.name, ang, src);
+        return false;
+    }
+    a.hold = clampf(ang, lo, hi);
+    a.hold_ok = true;
+    PTZ_LOG("PTZ: %s will hold current pose %.3f rad (%s)\n", a.name, a.hold, src);
+    return true;
+}
+
+static void finish_start(bool from_arm);
+
+// 기동 스레드: (콜드부팅이면) 대기 -> S 동시 -> 현재 자세 유지 스트림 -> 상태 확인 -> 이동 허용
+static void arm_thread_func(bool cold, bool need0, bool need1) {
+    bool need[2] = { need0, need1 };
+    if (cold) {
+        int delay = ARM_DELAY_DEFAULT_S;
+        const char* e = getenv("PTZ_ARM_DELAY_S");
+        if (e && *e) delay = std::max(0, std::min(300, atoi(e)));
+        double up = uptime_s();
+        if (up < delay) {
+            PTZ_LOG("PTZ: cold boot - waiting until uptime %ds before arming (now %.1fs)\n", delay, up);
+            while (uptime_s() < delay) usleep(200000);
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (!need[i]) continue;
+        AxisInfo& a = g_ax[i];
+        const char* why = a.force_s ? "first start after power-on" : (a.state_ok ? "not armed" : "state unknown");
+        char hold[64];
+        if (a.hold_ok) snprintf(hold, sizeof(hold), "hold %.3f", a.hold); else snprintf(hold, sizeof(hold), "no hold -> MCU goes to 0");
+        a.action = std::string("sent S (") + why + "), " + hold;
+        PTZ_LOG("PTZ-CMD: %s S - %s, %s\n", a.name, why, hold);
+    }
+    uint64_t s_us = now_us();
+    for (int i = 0; i < 2; ++i) if (need[i]) { g_s_sent_us[i].store(s_us); serial_write(g_ax[i].fd, "S\n"); }
+
+    // S 직후부터 현재 자세를 목표로 계속 보낸다 (Ready 되는 순간 0으로 끌어올리지 않도록)
+    char b[32];
+    while (now_us() - s_us < (uint64_t)HOLD_STREAM_MS * 1000ULL) {
+        for (int i = 0; i < 2; ++i) if (need[i] && g_ax[i].hold_ok) {
+            snprintf(b, sizeof(b), "T%.4f\n", g_ax[i].hold);
+            serial_write(g_ax[i].fd, b);
+        }
+        usleep(CONT_INTERVAL_US);
+    }
+    // 기동 후 목표각 확인
+    for (int i = 0; i < 2; ++i) {
+        if (g_ax[i].fd < 0) continue;
+        AxisInfo& a = g_ax[i];
+        float t = 0, c = 0, o = 0;
+        bool ok = false;
+        for (int k = 0; k < 4 && !ok; ++k) { ok = tel_query(i, t, c, o); if (!ok) usleep(300000); }
+        if (ok) { a.tgt = t; a.cur = c; a.off = o; a.off_known = 1; a.state_ok = true; a.start_target = t; a.start_target_ok = true; }
+        else if (need[i]) {
+            a.start_target = a.hold_ok ? a.hold : 0.0f; a.start_target_ok = true;
+            a.action += ", state not readable after S";
+            PTZ_LOG("PTZ: %s state not readable after S - assume target %.3f\n", a.name, a.start_target);
+        }
+    }
+    finish_start(true);
+}
+
+// 실시간 상태 파일 (/run/onvif_srvd/live). --mcu-info와 `watch -n1 cat`으로 본다.
+static const char* LIVE_STATE_STR[] = { "normal", "motor OFF", "not holding target", "no reply" };
+static void write_live(const bool ok[2], const float t[2], const float c[2], const float o[2],
+                       const int st[2], bool moving) {
+    std::string tmp = std::string(LIVE_PATH) + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f.is_open()) return;
+        char b[256];
+        snprintf(b, sizeof(b), "time:   %s%s\n", now_str().c_str(), moving ? "  (moving)" : "");
+        f << b;
+        for (int i = 0; i < 2; ++i) {
+            if (!ok[i]) { snprintf(b, sizeof(b), "%-5s  no reply\n", g_ax[i].name); f << b; continue; }
+            const float D = 57.29578f;
+            snprintf(b, sizeof(b), "%-5s  current %7.3f rad (%7.1f deg)  target %7.3f rad (%7.1f deg)  offset %.2f  %s\n",
+                     g_ax[i].name, wrapd(c[i]), wrapd(c[i]) * D, t[i], t[i] * D, o[i],
+                     (st[i] >= 0 && st[i] <= 3) ? LIVE_STATE_STR[st[i]] : "?");
+            f << b;
+        }
+    }
+    chmod(tmp.c_str(), 0644);
+    rename(tmp.c_str(), LIVE_PATH);
+}
+
+// 기동 후 30초 동안 1초 단위로 상태 기록 (조회만, 움직이지 않음)
+static void monitor_after_arm() {
+    uint64_t t0 = now_us();
+    for (int sec = 1; sec <= MONITOR_AFTER_ARM_S; ++sec) {
+        float t[2] = {0, 0}, c[2] = {0, 0}, o[2] = {0, 0};
+        bool ok[2] = { false, false };
+        for (int q = 0; q < 4; ++q) {      // 0.25초마다 조회, 1초에 한 줄 기록
+            for (int i = 0; i < 2; ++i) ok[i] = tel_query(i, t[i], c[i], o[i], 200) || ok[i];
+            uint64_t next = t0 + (uint64_t)((sec - 1) * 4 + q + 1) * 250000ULL;
+            if (now_us() < next) usleep((useconds_t)(next - now_us()));
+        }
+        { int st[2] = { 0, 0 }; write_live(ok, t, c, o, st, false); }
+        PTZ_LOG("PTZ-MON: +%02ds pan %s tilt %s\n", sec,
+                ok[0] ? (std::to_string(t[0]).substr(0, 5) + "/" + std::to_string(wrapd(c[0])).substr(0, 5) + " off " + std::to_string(o[0]).substr(0, 4)).c_str() : "?",
+                ok[1] ? (std::to_string(t[1]).substr(0, 5) + "/" + std::to_string(wrapd(c[1])).substr(0, 5) + " off " + std::to_string(o[1]).substr(0, 4)).c_str() : "?");
+    }
+}
+
+// 운영 중 감시: 0.5초마다 조회해 실시간 상태 파일을 갱신. 이상 판정·로그는 정지 상태에서만, 바뀔 때만.
+// 재시도는 하지 않는다.
+static void health_thread_func() {
+    monitor_after_arm();
+    int last_state[2] = { 0, 0 };   // 0 정상, 1 꺼짐(offset 0), 2 유지 못함, 3 무응답
+    while (true) {
+        usleep(HEALTH_PERIOD_MS * 1000);
+        bool moving = fabsf(g_cont_pan_vel.load()) >= 0.01f || fabsf(g_cont_tilt_vel.load()) >= 0.01f ||
+                      now_us() - g_last_move_us.load() < 3000000ULL;
+        bool ok[2] = { false, false };
+        float ta[2] = { 0, 0 }, ca[2] = { 0, 0 }, oa[2] = { 0, 0 };
+        int sta[2] = { 0, 0 };
+        for (int i = 0; i < 2; ++i) {
+            if (g_ax[i].fd < 0) continue;
+            ok[i] = tel_query(i, ta[i], ca[i], oa[i]);
+            float t = ta[i], c = ca[i], o = oa[i];
+            int st = 0;
+            if (!ok[i]) st = 3;
+            else if (fabsf(o) <= OFFSET_ZERO_EPS) st = 1;
+            else if (!moving && fabsf(wrapd(c - t)) > NOT_HOLDING_RAD) st = 2;
+            sta[i] = st;
+            if (moving) continue;   // 이동 중엔 판정을 바꾸지 않는다
+            if (st != last_state[i]) {
+                if (st == 0) PTZ_LOG("PTZ: %s back to normal (target %.2f, current %.2f)\n", g_ax[i].name, t, c);
+                else if (st == 1) PTZ_LOG("PTZ-ALERT: %s motor is OFF (offset 0) - not retrying\n", g_ax[i].name);
+                else if (st == 2) PTZ_LOG("PTZ-ALERT: %s not holding target (target %.2f, current %.2f)\n", g_ax[i].name, t, c);
+                else PTZ_LOG("PTZ-ALERT: %s no reply to state query\n", g_ax[i].name);
+                last_state[i] = st;
+            }
+        }
+        write_live(ok, ta, ca, oa, sta, moving);
+    }
+}
+
+// 시작 마무리: 위치 동기화 -> 이동 허용 -> 대기 중이던 이동 실행 -> 기록
+static float g_file_pan = 0, g_file_tilt = 0;
+static bool  g_have_file = false;
+
+static void finish_start(bool from_arm) {
+    float sp = g_ax[0].start_target_ok ? g_ax[0].start_target : (g_have_file ? g_file_pan : 0.0f);
+    float st = g_ax[1].start_target_ok ? g_ax[1].start_target : (g_have_file ? g_file_tilt : 0.0f);
+    set_current_pt(sp, st);
+    get_current_pt(sp, st);
+    g_sent[0].store(sp);
+    g_sent[1].store(st);
+    if (g_have_file && (fabsf(g_file_pan - sp) > 0.02f || fabsf(g_file_tilt - st) > 0.02f))
+        PTZ_LOG("PTZ: position.txt (%.3f, %.3f) differs from MCU target - using MCU (%.3f, %.3f)\n",
+                g_file_pan, g_file_tilt, sp, st);
+    {
+        float off[2]; bool ok[2];
+        for (int i = 0; i < 2; ++i) { off[i] = g_ax[i].off; ok[i] = g_ax[i].state_ok && g_ax[i].off_known; }
+        save_offsets_if_changed(off, ok);
+    }
+    g_motion_enabled.store(true);
+    save_position_to_file();
+    write_mcu_info();
+    PTZ_LOG("PTZ: motion enabled at (%.3f, %.3f)%s\n", sp, st, from_arm ? " after arming" : "");
+
+    bool pend; float pp, pt;
+    { std::lock_guard<std::mutex> lk(g_pending_mtx); pend = g_pending; pp = g_pending_pan; pt = g_pending_tilt; g_pending = false; }
+    if (pend) {
+        PTZ_LOG("PTZ: running move requested before arming -> (%.3f, %.3f)\n", pp, pt);
+        set_current_pt(pp, pt);
+        goto_current_pt();
+    }
+    std::thread(health_thread_func).detach();
+}
+
+void ptz_init(void) {
+    float fz = 0;
+    g_have_file = load_position_from_file(g_file_pan, g_file_tilt, fz);
+    set_current_zoom(g_have_file ? fz : 0.0f);
+    load_offsets();
+
+    bool cold = is_first_start_after_cold_boot();
+    PTZ_LOG("PTZ: boot %s\n", g_boot_desc.c_str());
+    // 표식 폴더가 아직 없으면(부팅 후 첫 시작) 먼저 만든다. 없으면 표식이 안 남아 다음 재시작을 콜드부팅으로 오판한다.
+    ensure_dir(RUN_DIR);
+    {
+        std::ofstream m(STARTED_MARK_PATH, std::ios::trunc);
+        if (m.is_open()) m << now_str() << "\n";
+        else PTZ_LOG("PTZ-ALERT: cannot write %s - next restart may be judged as cold boot\n", STARTED_MARK_PATH);
+    }
+    chmod(STARTED_MARK_PATH, 0644);
+
+    for (int i = 0; i < 2; ++i) {
+        g_ax[i].force_s = cold;
+        g_ax[i].fd = open_serial_port(g_ax[i].port, true);
+        if (g_ax[i].fd == -2)
+            PTZ_LOG("PTZ: %s is held by another process - not used\n", g_ax[i].port);
+    }
+    // 1) 판정 (여기까지는 직접 읽기)
+    bool need[2] = { false, false };
+    for (int i = 0; i < 2; ++i) if (g_ax[i].fd >= 0) need[i] = decide_axis(g_ax[i]);
+
+    // 한계: 스펙 ∩ 펌웨어
+    if (g_ax[0].have_fw_lim) { PAN_MIN  = std::max(SPEC_PAN_MIN,  g_ax[0].fw_min); PAN_MAX  = std::min(SPEC_PAN_MAX,  g_ax[0].fw_max); }
+    if (g_ax[1].have_fw_lim) { TILT_MIN = std::max(SPEC_TILT_MIN, g_ax[1].fw_min); TILT_MAX = std::min(SPEC_TILT_MAX, g_ax[1].fw_max); }
+    PTZ_LOG("PTZ: limits pan[%.3f,%.3f] tilt[%.3f,%.3f]\n", PAN_MIN, PAN_MAX, TILT_MIN, TILT_MAX);
+
+    for (int i = 0; i < 2; ++i) {
+        AxisInfo& a = g_ax[i];
+        if (!need[i]) { if (a.state_ok) { a.start_target = a.tgt; a.start_target_ok = true; } continue; }
+        compute_hold(i, a, i == 0 ? PAN_MIN : TILT_MIN, i == 0 ? PAN_MAX : TILT_MAX);
+    }
+    // 기동 전 ONVIF가 보여줄 위치: 기동된 축은 MCU 목표, 아닌 축은 유지할 자세(모르면 저장값)
+    {
+        float sp = g_ax[0].start_target_ok ? g_ax[0].start_target : (g_ax[0].hold_ok ? g_ax[0].hold : g_file_pan);
+        float st = g_ax[1].start_target_ok ? g_ax[1].start_target : (g_ax[1].hold_ok ? g_ax[1].hold : g_file_tilt);
+        set_current_pt(sp, st);
+    }
+
+    // 2) 이후 수신은 전용 스레드
+    std::thread(serial_reader_thread_func).detach();
+    std::thread(continuous_move_thread_func).detach();
+    mqtt_init();
+
+    if (need[0] || need[1]) {
+        write_mcu_info();
+        std::thread(arm_thread_func, cold, need[0], need[1]).detach();
+        PTZ_LOG("PTZ: ready - arming in background (%s)\n", MK3_BUILD_INFO);
+    } else {
+        finish_start(false);
+        PTZ_LOG("PTZ: ready (%s)\n", MK3_BUILD_INFO);
+    }
+}
+
+// ===== onvif_srvd --mcu-info[=full] / --mcu-watch[=sec] =====
+// 화면 구성: 위 = 실시간(LIVE, 굵은 밝은 색), 아래 = 시작 때 기록(고정 정보, 옅은/다른 색).
+// 기본은 한 화면(약 24줄)에 들어가도록 펌웨어 설정 덤프('  | ' 줄)를 뺀다. =full이면 포함.
+namespace cli {
+static bool C = false;   // 색 사용 여부
+static const char* RST   = "\033[0m";
+static const char* DIM   = "\033[2m";
+static const char* RED   = "\033[1;91m";
+static const char* GREEN = "\033[32m";
+// 색은 최소로: 실시간 현재 각도(노랑) + 상태(초록/빨강)만 강조, 고정 정보는 회색
+static const char* BOLD      = "\033[1m";
+static const char* LIVE_HDR  = "\033[1m";        // LIVE 제목: 굵게
+static const char* CUR       = "\033[1;93m";     // 실시간 현재 각도: 굵은 노랑
+static const char* FIX_HDR   = "\033[2m";        // 고정 정보 제목: 회색
+static std::string c(const char* code, const std::string& s) { return C ? std::string(code) + s + RST : s; }
+
+static bool starts(const std::string& s, const char* p) { return s.compare(0, strlen(p), p) == 0; }
+
+// 실시간 한 줄 색칠: 축 이름 굵게, 현재 각도만 노랑, 상태 단어는 정상=초록 / 그 외=빨강
+static std::string live_line(const std::string& l) {
+    if (starts(l, "time:")) {
+        size_t m = l.find("(moving)");
+        if (m == std::string::npos) return c(DIM, l);
+        return c(DIM, l.substr(0, m)) + c(BOLD, "(moving)");
+    }
+    if (!starts(l, "pan") && !starts(l, "tilt")) return l;
+    // "pan    current  -0.397 rad (  -22.7 deg)  target ...  offset 5.68  normal"
+    size_t name_end = l.find(' ');
+    size_t cs = l.find("current"), ce = l.find("deg)", cs == std::string::npos ? 0 : cs);
+    size_t st = l.find("offset ");
+    if (st != std::string::npos) st = l.find("  ", st);
+    if (name_end == std::string::npos || cs == std::string::npos || ce == std::string::npos || st == std::string::npos)
+        return l;
+    ce += 4;
+    std::string state = l.substr(st + 2);
+    return c(BOLD, l.substr(0, name_end)) + l.substr(name_end, cs - name_end) +
+           c(CUR, l.substr(cs, ce - cs)) + l.substr(ce, st - ce) + "  " +
+           c(state == "normal" ? GREEN : RED, state);
+}
+
+// 시작 기록 한 줄 색칠
+static std::string fixed_line(const std::string& l, const char*& axis_col) {
+    // 고정 정보는 축 제목만 기본색, 나머지는 회색. 경고(현재 자세 유지 실패)만 빨강
+    if (starts(l, "[pan]") || starts(l, "[tilt]")) { axis_col = DIM; return l; }
+    if (l.empty()) { axis_col = nullptr; return l; }
+    if (starts(l, "  action:") && (l.find("no hold") != std::string::npos || l.find("goes to 0") != std::string::npos))
+        return c(RED, l);
+    return c(DIM, l);
+}
+
+static std::string read_file(const char* p) {
+    std::ifstream f(p);
+    if (!f.is_open()) return "";
+    std::stringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+
+static std::string render_fixed(const std::string& txt, bool full) {
+    std::string out;
+    std::istringstream in(txt);
+    std::string l;
+    const char* axis_col = nullptr;
+    while (std::getline(in, l)) {
+        if (!full && (starts(l, "  | ") || starts(l, "source:") || starts(l, "limits in use"))) continue;
+        out += fixed_line(l, axis_col) + "\n";
+    }
+    while (out.size() >= 2 && out.compare(out.size() - 2, 2, "\n\n") == 0) out.pop_back();   // 끝 빈 줄 제거
+    return out;
+}
+
+// 데몬 실행 중: live 파일 + 시작 기록 파일
+static std::string render_daemon(bool full) {
+    std::string out = c(LIVE_HDR, " LIVE  (onvif_srvd, every 0.5 s) ") + "\n";
+    struct stat ls{};
+    std::string live = read_file(LIVE_PATH);
+    if (!live.empty() && stat(LIVE_PATH, &ls) == 0) {
+        std::istringstream in(live);
+        std::string l;
+        while (std::getline(in, l)) out += live_line(l) + "\n";
+        long age = (long)(time(nullptr) - ls.st_mtime);
+        if (age > 3) out += c(RED, "!! not updated for " + std::to_string(age) + " s (onvif_srvd busy or stuck?)") + "\n";
+    } else {
+        out += c(DIM, "(not available yet - motors not armed, or onvif_srvd just started)") + "\n";
+    }
+    out += "\n" + c(FIX_HDR, " START-UP RECORD (fixed) ") + "\n";
+    std::string fx = read_file(MCU_INFO_PATH);
+    if (fx.empty()) out += std::string("(") + MCU_INFO_PATH + " is missing)\n";
+    else out += render_fixed(fx, full);
+    if (!full) out += c(DIM, "(--mcu-info=full : firmware settings)") + "\n";
+    return out;
+}
+
+// 데몬이 없을 때: 직접 조회 (V/T만 - 'I'는 미기동 MCU의 offset을 채워 다음 기동 판정을 흐리므로 안 보냄)
+static std::string render_direct(bool first) {
+    for (int i = 0; i < 2; ++i) if (g_ax[i].fd >= 0) { if (first) query_version(g_ax[i]); query_state(g_ax[i]); }
+    std::string out = c(LIVE_HDR, " DIRECT QUERY  (onvif_srvd not running) ") + "\n";
+    const char* axis_col = nullptr;
+    std::istringstream in(mcu_report(false));
+    std::string l;
+    while (std::getline(in, l)) {
+        if (starts(l, "[pan]") || starts(l, "[tilt]")) { axis_col = BOLD; out += c(BOLD, l) + "\n"; continue; }
+        if (l.empty()) axis_col = nullptr;
+        out += (axis_col && starts(l, "  ") ? l : c(DIM, l)) + "\n";
+    }
+    return out;
+}
+} // namespace cli
+
+int ptz_mcu_info_cli(const char* mode, int watch_ms) {
+    bool full = mode && strcmp(mode, "full") == 0;
+    if (mode && !full) { fprintf(stderr, "unknown --mcu-info mode '%s' (use --mcu-info or --mcu-info=full)\n", mode); return 2; }
+    const char* nc = getenv("NO_COLOR");
+    cli::C = (isatty(STDOUT_FILENO) && !(nc && *nc)) || (getenv("MCU_COLOR") && *getenv("MCU_COLOR"));
+
+    bool busy = false;
+    for (int i = 0; i < 2; ++i) {
+        g_ax[i].fd = open_serial_port(g_ax[i].port, true);
+        if (g_ax[i].fd == -2) busy = true;
+    }
+    if (busy) for (int i = 0; i < 2; ++i) if (g_ax[i].fd >= 0) { close(g_ax[i].fd); g_ax[i].fd = -1; }
+    // 데몬이 없을 때 반복 조회는 하지 않는다: 그동안 포트를 잡고 있으면 onvif_srvd가 시작하며 포트를 못 얻는다.
+    if (!busy && watch_ms > 0) {
+        fputs(cli::render_direct(true).c_str(), stdout);
+        printf("\n%s\n", cli::c(cli::RED, "onvif_srvd is not running - --mcu-watch works only while it runs (shown once)").c_str());
+        for (int i = 0; i < 2; ++i) if (g_ax[i].fd >= 0) close(g_ax[i].fd);
+        return 1;
+    }
+
+    for (bool first = true;; first = false) {
+        std::string out = busy ? cli::render_daemon(full) : cli::render_direct(first);
+        if (watch_ms > 0) {
+            char ft[96];
+            snprintf(ft, sizeof(ft), "every %.1f s  -  Ctrl+C to quit", watch_ms / 1000.0);
+            out = "\033[H\033[2J" + out + cli::c(cli::DIM, ft) + "\n";
+        }
+        fputs(out.c_str(), stdout);
+        fflush(stdout);
+        if (watch_ms <= 0) break;
+        usleep((useconds_t)watch_ms * 1000);
+    }
+    for (int i = 0; i < 2; ++i) if (g_ax[i].fd >= 0) close(g_ax[i].fd);
+    return 0;
+}
+
+const char* ptz_build_info(void) { return MK3_BUILD_INFO; }
+
+// ===== Zoom (ONVIF SOAP, libcurl) =====
+// 줌 카메라 응답 본문은 버린다 (기본 동작은 stdout 출력 -> 로그에 XML 이 쌓였음)
+static size_t zoom_discard_body(char*, size_t size, size_t nmemb, void*) { return size * nmemb; }
+
+static void zoom_soap_call(const char* xml_body) {
+    CURL* curl = curl_easy_init();
+    if (!curl) { PTZ_LOG("PTZ[ZOOM]: curl_easy_init failed\n"); return; }
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/soap+xml; charset=utf-8");
+    curl_easy_setopt(curl, CURLOPT_URL,        ZOOM_CAM_URL);
+    curl_easy_setopt(curl, CURLOPT_HTTPAUTH,   CURLAUTH_ANY);
+    curl_easy_setopt(curl, CURLOPT_USERPWD,    ZOOM_CAM_USERPWD);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, xml_body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,    3L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,   1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, zoom_discard_body);
+    CURLcode res = curl_easy_perform(curl);
+    long http = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
+    if (res != CURLE_OK) PTZ_LOG("PTZ[ZOOM]: curl error: %s\n", curl_easy_strerror(res));
+    else if (http != 200) PTZ_LOG("PTZ[ZOOM]: zoom camera replied HTTP %ld\n", http);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+}
+
+static void zoom_soap_absolute(float level) {
+    char body[1024];
+    snprintf(body, sizeof(body),
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\""
+                    " xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\""
+                    " xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+          "<s:Body><tptz:AbsoluteMove>"
+            "<tptz:ProfileToken>%s</tptz:ProfileToken>"
+            "<tptz:Position><tt:Zoom x=\"%.3f\"/></tptz:Position>"
+          "</tptz:AbsoluteMove></s:Body></s:Envelope>",
+        ZOOM_CAM_TOKEN, level);
+    zoom_soap_call(body);
+}
+
+static void zoom_soap_continuous(float velocity) {
+    char body[1024];
+    if (fabsf(velocity) < 0.01f) {
+        snprintf(body, sizeof(body),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\""
+                        " xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\">"
+              "<s:Body><tptz:Stop>"
+                "<tptz:ProfileToken>%s</tptz:ProfileToken>"
+                "<tptz:Zoom>true</tptz:Zoom>"
+              "</tptz:Stop></s:Body></s:Envelope>",
+            ZOOM_CAM_TOKEN);
+    } else {
+        snprintf(body, sizeof(body),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\""
+                        " xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\""
+                        " xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+              "<s:Body><tptz:ContinuousMove>"
+                "<tptz:ProfileToken>%s</tptz:ProfileToken>"
+                "<tptz:Velocity><tt:Zoom x=\"%.3f\"/></tptz:Velocity>"
+              "</tptz:ContinuousMove></s:Body></s:Envelope>",
+            ZOOM_CAM_TOKEN, velocity);
+    }
+    zoom_soap_call(body);
+}
+
+static void goto_current_zoom() {
+    zoom_soap_absolute(get_current_zoom());
+    save_position_to_file();
+}
+
+// ===== 프리셋 =====
+struct PresetRec {
+    float pan, tilt, zoom;
+    std::string name;
+    PresetRec() : pan(0), tilt(0), zoom(0), name() {}
+};
+static std::mutex g_preset_mtx;
+static std::map<std::string, PresetRec> g_presets;
+
+static void load_presets_from_file() {
+    std::lock_guard<std::mutex> lock(g_preset_mtx);
+    g_presets.clear();
+    std::ifstream fin(PRESET_DB_PATH);
+    if (!fin.is_open()) return;
+    std::string token, name;
+    float pan, tilt, zoom;
+    while (fin >> token >> pan >> tilt >> zoom >> name) {
+        PresetRec rec;
+        rec.pan = pan; rec.tilt = tilt; rec.zoom = zoom; rec.name = name;
+        g_presets[token] = rec;
+    }
+}
+
+static void save_presets_to_file() {
+    std::lock_guard<std::mutex> lock(g_preset_mtx);
+    ensure_dir(PRESET_DB_DIR);
+    std::ofstream fout(PRESET_DB_PATH, std::ios::trunc);
+    if (!fout.is_open()) return;
+    for (const auto& kv : g_presets) {
+        const PresetRec& r = kv.second;
+        fout << kv.first << " " << r.pan << " " << r.tilt << " " << r.zoom << " "
+             << (r.name.empty() ? kv.first : r.name) << "\n";
+    }
+}
+
+// ===== PTZ 노드/스페이스 =====
+static int GetPTZNode(struct soap* soap, tt__PTZNode* ptzn) {
+    if (!soap || !ptzn) return SOAP_FAULT;
+
+    ptzn->token = "PTZNodeToken";
+    ptzn->Name  = soap_new_std_string(soap, "PTZ");
+
+    ptzn->SupportedPTZSpaces = soap_new_req_tt__PTZSpaces(soap);
+    if (!ptzn->SupportedPTZSpaces) return SOAP_FAULT;
+
+    soap_default_std__vectorTemplateOfPointerTott__Space2DDescription(soap, &ptzn->SupportedPTZSpaces->tt__PTZSpaces::AbsolutePanTiltPositionSpace);
+    soap_default_std__vectorTemplateOfPointerTott__Space2DDescription(soap, &ptzn->SupportedPTZSpaces->tt__PTZSpaces::RelativePanTiltTranslationSpace);
+    soap_default_std__vectorTemplateOfPointerTott__Space1DDescription(soap, &ptzn->SupportedPTZSpaces->tt__PTZSpaces::RelativeZoomTranslationSpace);
+    soap_default_std__vectorTemplateOfPointerTott__Space2DDescription(soap, &ptzn->SupportedPTZSpaces->tt__PTZSpaces::ContinuousPanTiltVelocitySpace);
+    soap_default_std__vectorTemplateOfPointerTott__Space1DDescription(soap, &ptzn->SupportedPTZSpaces->tt__PTZSpaces::ContinuousZoomVelocitySpace);
+    soap_default_std__vectorTemplateOfPointerTott__Space1DDescription(soap, &ptzn->SupportedPTZSpaces->tt__PTZSpaces::PanTiltSpeedSpace);
+    soap_default_std__vectorTemplateOfPointerTott__Space1DDescription(soap, &ptzn->SupportedPTZSpaces->tt__PTZSpaces::ZoomSpeedSpace);
+
+    tt__Space2DDescription* abs_pt = soap_new_tt__Space2DDescription(soap);
+    if (abs_pt) {
+        abs_pt->URI    = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace";
+        abs_pt->XRange = soap_new_req_tt__FloatRange(soap, PAN_MIN,  PAN_MAX);
+        abs_pt->YRange = soap_new_req_tt__FloatRange(soap, TILT_MIN, TILT_MAX);
+    }
+    ptzn->SupportedPTZSpaces->AbsolutePanTiltPositionSpace.emplace_back(abs_pt);
+
+    tt__Space2DDescription* ptzs1 = soap_new_tt__Space2DDescription(soap);
+    if (ptzs1) {
+        ptzs1->URI    = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationGenericSpace";
+        ptzs1->XRange = soap_new_req_tt__FloatRange(soap, -1.0f, 1.0f);
+        ptzs1->YRange = soap_new_req_tt__FloatRange(soap, -1.0f, 1.0f);
+    }
+    ptzn->SupportedPTZSpaces->RelativePanTiltTranslationSpace.emplace_back(ptzs1);
+
+    tt__Space1DDescription* ptzs2 = soap_new_tt__Space1DDescription(soap);
+    if (ptzs2) {
+        ptzs2->URI    = "http://www.onvif.org/ver10/tptz/ZoomSpaces/TranslationGenericSpace";
+        ptzs2->XRange = soap_new_req_tt__FloatRange(soap, -1.0f, 1.0f);
+    }
+    ptzn->SupportedPTZSpaces->RelativeZoomTranslationSpace.emplace_back(ptzs2);
+
+    tt__Space2DDescription* ptzs3 = soap_new_tt__Space2DDescription(soap);
+    if (ptzs3) {
+        ptzs3->URI    = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace";
+        ptzs3->XRange = soap_new_req_tt__FloatRange(soap, -1.0f, 1.0f);
+        ptzs3->YRange = soap_new_req_tt__FloatRange(soap, -1.0f, 1.0f);
+    }
+    ptzn->SupportedPTZSpaces->ContinuousPanTiltVelocitySpace.emplace_back(ptzs3);
+
+    tt__Space1DDescription* ptzs4 = soap_new_tt__Space1DDescription(soap);
+    if (ptzs4) {
+        ptzs4->URI    = "http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace";
+        ptzs4->XRange = soap_new_req_tt__FloatRange(soap, -1.0f, 1.0f);
+    }
+    ptzn->SupportedPTZSpaces->ContinuousZoomVelocitySpace.emplace_back(ptzs4);
+
+    tt__Space1DDescription* ptzs5 = soap_new_tt__Space1DDescription(soap);
+    if (ptzs5) {
+        ptzs5->URI    = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/GenericSpeedSpace";
+        ptzs5->XRange = soap_new_req_tt__FloatRange(soap, 0.0f, 1.0f);
+    }
+    ptzn->SupportedPTZSpaces->PanTiltSpeedSpace.emplace_back(ptzs5);
+
+    tt__Space1DDescription* ptzs6 = soap_new_tt__Space1DDescription(soap);
+    if (ptzs6) {
+        ptzs6->URI    = "http://www.onvif.org/ver10/tptz/ZoomSpaces/ZoomGenericSpeedSpace";
+        ptzs6->XRange = soap_new_req_tt__FloatRange(soap, 0.0f, 1.0f);
+    }
+    ptzn->SupportedPTZSpaces->ZoomSpeedSpace.emplace_back(ptzs6);
+
+    ptzn->MaximumNumberOfPresets = 64;
+    ptzn->HomeSupported          = true;
+    ptzn->FixedHomePosition      = soap_new_ptr(soap, true);
+    return SOAP_OK;
+}
+
+int PTZBindingService::GetNodes(
+    _tptz__GetNodes* tptz__GetNodes,
+    _tptz__GetNodesResponse& tptz__GetNodesResponse)
+{
+    UNUSED(tptz__GetNodes);
+    soap_default_std__vectorTemplateOfPointerTott__PTZNode(
+        soap, &tptz__GetNodesResponse._tptz__GetNodesResponse::PTZNode);
+    tt__PTZNode* ptzn = soap_new_tt__PTZNode(soap);
+    GetPTZNode(soap, ptzn);
+    tptz__GetNodesResponse.PTZNode.emplace_back(ptzn);
+    return SOAP_OK;
+}
+
+int PTZBindingService::GetNode(
+    _tptz__GetNode* tptz__GetNode,
+    _tptz__GetNodeResponse& tptz__GetNodeResponse)
+{
+    UNUSED(tptz__GetNode);
+    tptz__GetNodeResponse.PTZNode = soap_new_tt__PTZNode(soap);
+    GetPTZNode(soap, tptz__GetNodeResponse.PTZNode);
+    return SOAP_OK;
+}
+
+int PTZBindingService::GetPresets(
+    _tptz__GetPresets* tptz__GetPresets,
+    _tptz__GetPresetsResponse& tptz__GetPresetsResponse)
+{
+    UNUSED(tptz__GetPresets);
+    load_presets_from_file();
+    soap_default_std__vectorTemplateOfPointerTott__PTZPreset(
+        soap, &tptz__GetPresetsResponse._tptz__GetPresetsResponse::Preset);
+    std::lock_guard<std::mutex> lock(g_preset_mtx);
+    for (const auto& kv : g_presets) {
+        const PresetRec& p = kv.second;
+        tt__PTZPreset* ptzp = soap_new_tt__PTZPreset(soap);
+        ptzp->token = soap_new_std_string(soap, kv.first);
+        ptzp->Name  = soap_new_std_string(soap, p.name.empty() ? kv.first : p.name);
+        ptzp->PTZPosition = soap_new_req_tt__PTZVector(soap);
+        ptzp->PTZPosition->PanTilt = soap_new_req_tt__Vector2D(soap, p.pan, p.tilt);
+        ptzp->PTZPosition->Zoom    = soap_new_req_tt__Vector1D(soap, p.zoom);
+        tptz__GetPresetsResponse.Preset.emplace_back(ptzp);
+    }
+    return SOAP_OK;
+}
+
+int PTZBindingService::SetPreset(
+    _tptz__SetPreset* tptz__SetPreset,
+    _tptz__SetPresetResponse& tptz__SetPresetResponse)
+{
+    if (!tptz__SetPreset || tptz__SetPreset->ProfileToken.empty()) return SOAP_OK;
+    load_presets_from_file();
+    std::string token;
+    if (tptz__SetPreset->PresetToken && !tptz__SetPreset->PresetToken->empty())
+        token = *tptz__SetPreset->PresetToken;
+    else {
+        std::lock_guard<std::mutex> lock(g_preset_mtx);
+        int next_id = 1;
+        while (g_presets.count(std::to_string(next_id))) ++next_id;
+        token = std::to_string(next_id);
+    }
+    PresetRec cur;
+    get_current_pt(cur.pan, cur.tilt);
+    cur.zoom = get_current_zoom();
+    if (tptz__SetPreset->PresetName && !tptz__SetPreset->PresetName->empty())
+        cur.name = *tptz__SetPreset->PresetName;
+    { std::lock_guard<std::mutex> lock(g_preset_mtx); g_presets[token] = cur; }
+    save_presets_to_file();
+    tptz__SetPresetResponse.PresetToken = token;
+    return SOAP_OK;
+}
+
+int PTZBindingService::RemovePreset(
+    _tptz__RemovePreset* tptz__RemovePreset,
+    _tptz__RemovePresetResponse& tptz__RemovePresetResponse)
+{
+    UNUSED(tptz__RemovePresetResponse);
+    if (!tptz__RemovePreset ||
+        tptz__RemovePreset->ProfileToken.empty() ||
+        tptz__RemovePreset->PresetToken.empty()) return SOAP_OK;
+    load_presets_from_file();
+    { std::lock_guard<std::mutex> lock(g_preset_mtx); g_presets.erase(tptz__RemovePreset->PresetToken); }
+    save_presets_to_file();
+    return SOAP_OK;
+}
+
+int PTZBindingService::GotoPreset(
+    _tptz__GotoPreset* tptz__GotoPreset,
+    _tptz__GotoPresetResponse& tptz__GotoPresetResponse)
+{
+    UNUSED(tptz__GotoPresetResponse);
+    if (!tptz__GotoPreset ||
+        tptz__GotoPreset->ProfileToken.empty() ||
+        tptz__GotoPreset->PresetToken.empty()) return SOAP_OK;
+    if (is_tracking_locked()) { DEBUG_MSG("PTZ: GotoPreset blocked (tracking lock)\n"); return SOAP_OK; }
+    load_presets_from_file();
+    PresetRec rec;
+    {
+        std::lock_guard<std::mutex> lock(g_preset_mtx);
+        auto it = g_presets.find(tptz__GotoPreset->PresetToken);
+        if (it == g_presets.end()) return SOAP_OK;
+        rec = it->second;
+    }
+    set_current_pt(rec.pan, rec.tilt);
+    set_current_zoom(rec.zoom);
+    goto_current_pt();
+    goto_current_zoom();
+    return SOAP_OK;
+}
+
+// ===== 홈 포지션 =====
+static std::mutex g_home_mtx;
+static float g_home_pan = 0.0f, g_home_tilt = 0.0f, g_home_zoom = 0.0f;
+
+int PTZBindingService::GotoHomePosition(
+    _tptz__GotoHomePosition* req,
+    _tptz__GotoHomePositionResponse& res)
+{
+    UNUSED(res);
+    if (!req || req->ProfileToken.empty()) return SOAP_OK;
+    if (is_tracking_locked()) { DEBUG_MSG("PTZ: GotoHome blocked (tracking lock)\n"); return SOAP_OK; }
+    float hp, ht, hz;
+    { std::lock_guard<std::mutex> lk(g_home_mtx); hp = g_home_pan; ht = g_home_tilt; hz = g_home_zoom; }
+    set_current_pt(hp, ht);
+    set_current_zoom(hz);
+    goto_current_pt();
+    goto_current_zoom();
+    return SOAP_OK;
+}
+
+int PTZBindingService::SetHomePosition(
+    _tptz__SetHomePosition* tptz__SetHomePosition,
+    _tptz__SetHomePositionResponse& tptz__SetHomePositionResponse)
+{
+    UNUSED(tptz__SetHomePosition);
+    UNUSED(tptz__SetHomePositionResponse);
+    float pan, tilt;
+    get_current_pt(pan, tilt);
+    float zoom = get_current_zoom();
+    { std::lock_guard<std::mutex> lk(g_home_mtx); g_home_pan = pan; g_home_tilt = tilt; g_home_zoom = zoom; }
+    return SOAP_OK;
+}
+
+// ===== 이동 =====
+int PTZBindingService::AbsoluteMove(
+    _tptz__AbsoluteMove* req,
+    _tptz__AbsoluteMoveResponse& res)
+{
+    UNUSED(res);
+    if (!req || req->ProfileToken.empty()) return SOAP_OK;
+    if (is_tracking_locked()) { DEBUG_MSG("PTZ: AbsoluteMove blocked (tracking lock)\n"); return SOAP_OK; }
+    if (req->Position && req->Position->PanTilt) {
+        float tsign = is_hang_mode() ? -1.0f : 1.0f;
+        set_current_pt(req->Position->PanTilt->x, req->Position->PanTilt->y * tsign);
+        // 선택 항목 Speed(0~1): 없으면 기존 기본 속도
+        float speed = (req->Speed && req->Speed->PanTilt) ? req->Speed->PanTilt->x : -1.0f;
+        goto_current_pt(speed);
+    }
+    if (req->Position && req->Position->Zoom) {
+        set_current_zoom(req->Position->Zoom->x);
+        goto_current_zoom();
+    }
+    return SOAP_OK;
+}
+
+static float g_last_zoom_vel = 0.0f;
+
+int PTZBindingService::ContinuousMove(
+    _tptz__ContinuousMove* req,
+    _tptz__ContinuousMoveResponse& res)
+{
+    UNUSED(res);
+    if (!req || req->ProfileToken.empty()) return SOAP_OK;
+    if (is_tracking_locked()) { DEBUG_MSG("PTZ: ContinuousMove blocked (tracking lock)\n"); return SOAP_OK; }
+    g_cont_last_cmd_us.store(now_us());
+    if (req->Velocity && req->Velocity->PanTilt) {
+        g_cont_pan_vel.store(req->Velocity->PanTilt->x);
+        g_cont_tilt_vel.store(req->Velocity->PanTilt->y);
+    }
+    if (req->Velocity && req->Velocity->Zoom) {
+        const float vz = req->Velocity->Zoom->x;
+        if (fabsf(vz - g_last_zoom_vel) >= 0.01f) {
+            g_last_zoom_vel = vz;
+            zoom_soap_continuous(vz);
+        }
+    }
+    return SOAP_OK;
+}
+
+int PTZBindingService::RelativeMove(
+    _tptz__RelativeMove* req,
+    _tptz__RelativeMoveResponse& res)
+{
+    UNUSED(res);
+    if (!req || req->ProfileToken.empty()) return SOAP_OK;
+    if (is_tracking_locked()) { DEBUG_MSG("PTZ: RelativeMove blocked (tracking lock)\n"); return SOAP_OK; }
+    if (req->Translation && req->Translation->PanTilt) {
+        float tsign = is_hang_mode() ? -1.0f : 1.0f;
+        const float dpan  = req->Translation->PanTilt->x * REL_SCALE_PAN;
+        const float dtilt = req->Translation->PanTilt->y * tsign * REL_SCALE_TILT;
+        if (dpan != 0.0f || dtilt != 0.0f) {
+            adjust_current_pt(dpan, dtilt);
+            goto_current_pt();
+        }
+    }
+    if (req->Translation && req->Translation->Zoom) {
+        const float dzoom = req->Translation->Zoom->x * REL_SCALE_ZOOM;
+        if (dzoom != 0.0f) {
+            adjust_current_zoom(dzoom);
+            goto_current_zoom();
+        }
+    }
+    return SOAP_OK;
+}
+
+int PTZBindingService::Stop(_tptz__Stop* req, _tptz__StopResponse& res)
+{
+    UNUSED(res);
+    if (!req || req->ProfileToken.empty()) return SOAP_OK;
+    if (is_tracking_locked()) { DEBUG_MSG("PTZ: Stop blocked (tracking lock)\n"); return SOAP_OK; }
+    if (!req->PanTilt || *req->PanTilt) {
+        g_cont_pan_vel.store(0.0f);
+        g_cont_tilt_vel.store(0.0f);
+        goto_current_pt();
+    }
+    if (!req->Zoom || *req->Zoom) {
+        g_last_zoom_vel = 999.0f;
+        zoom_soap_continuous(0.0f);
+    }
+    return SOAP_OK;
+}
+
+int PTZBindingService::GetStatus(
+    _tptz__GetStatus* tptz__GetStatus,
+    _tptz__GetStatusResponse& tptz__GetStatusResponse)
+{
+    UNUSED(tptz__GetStatus);
+    float pan, tilt;
+    get_current_pt(pan, tilt);
+    float zoom = get_current_zoom();
+    float tsign = is_hang_mode() ? -1.0f : 1.0f;
+
+    tptz__GetStatusResponse.PTZStatus = soap_new_tt__PTZStatus(soap);
+    tptz__GetStatusResponse.PTZStatus->Position = soap_new_tt__PTZVector(soap);
+    tptz__GetStatusResponse.PTZStatus->Position->PanTilt = soap_new_req_tt__Vector2D(soap, pan, tilt * tsign);
+    tptz__GetStatusResponse.PTZStatus->Position->Zoom    = soap_new_req_tt__Vector1D(soap, zoom);
+    tptz__GetStatusResponse.PTZStatus->MoveStatus = soap_new_tt__PTZMoveStatus(soap);
+    tptz__GetStatusResponse.PTZStatus->MoveStatus->PanTilt = soap_new_ptr(soap, tt__MoveStatus::IDLE);
+    tptz__GetStatusResponse.PTZStatus->MoveStatus->Zoom    = soap_new_ptr(soap, tt__MoveStatus::IDLE);
+    tptz__GetStatusResponse.PTZStatus->UtcTime = time(nullptr);
+    return SOAP_OK;
+}
+
+// ===== 설정 =====
+int PTZBindingService::GetServiceCapabilities(
+    _tptz__GetServiceCapabilities* tptz__GetServiceCapabilities,
+    _tptz__GetServiceCapabilitiesResponse& tptz__GetServiceCapabilitiesResponse)
+{
+    UNUSED(tptz__GetServiceCapabilities);
+    auto ctx = (ServiceContext*)soap->user;
+    tptz__GetServiceCapabilitiesResponse.Capabilities = ctx->getPTZServiceCapabilities(soap);
+    return SOAP_OK;
+}
+
+int PTZBindingService::GetConfigurations(
+    _tptz__GetConfigurations* tptz__GetConfigurations,
+    _tptz__GetConfigurationsResponse& tptz__GetConfigurationsResponse)
+{
+    UNUSED(tptz__GetConfigurations);
+    auto ctx = (ServiceContext*)soap->user;
+    for (auto& p : ctx->get_profiles()) {
+        tt__PTZConfiguration* cfg = p.second.get_ptz_cfg(soap);
+        if (cfg) tptz__GetConfigurationsResponse.PTZConfiguration.push_back(cfg);
+    }
+    return SOAP_OK;
+}
+
+int PTZBindingService::GetConfiguration(
+    _tptz__GetConfiguration* tptz__GetConfiguration,
+    _tptz__GetConfigurationResponse& tptz__GetConfigurationResponse)
+{
+    auto ctx = (ServiceContext*)soap->user;
+    for (auto& p : ctx->get_profiles()) {
+        tt__PTZConfiguration* cfg = p.second.get_ptz_cfg(soap);
+        if (cfg && cfg->token == tptz__GetConfiguration->PTZConfigurationToken) {
+            tptz__GetConfigurationResponse.PTZConfiguration = cfg;
+            return SOAP_OK;
+        }
+    }
+    auto profiles = ctx->get_profiles();
+    if (!profiles.empty())
+        tptz__GetConfigurationResponse.PTZConfiguration = profiles.begin()->second.get_ptz_cfg(soap);
+    return SOAP_OK;
+}
+
+int PTZBindingService::SetConfiguration(
+    _tptz__SetConfiguration* tptz__SetConfiguration,
+    _tptz__SetConfigurationResponse& tptz__SetConfigurationResponse)
+{
+    UNUSED(tptz__SetConfiguration);
+    UNUSED(tptz__SetConfigurationResponse);
+    return SOAP_OK;
+}
+
+int PTZBindingService::GetConfigurationOptions(
+    _tptz__GetConfigurationOptions* tptz__GetConfigurationOptions,
+    _tptz__GetConfigurationOptionsResponse& tptz__GetConfigurationOptionsResponse)
+{
+    UNUSED(tptz__GetConfigurationOptions);
+    auto options = soap_new_tt__PTZConfigurationOptions(soap);
+    if (!options) return SOAP_FAULT;
+    options->Spaces = soap_new_tt__PTZSpaces(soap);
+    if (options->Spaces) {
+        auto abs_pt = soap_new_tt__Space2DDescription(soap);
+        if (abs_pt) {
+            abs_pt->URI    = "http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace";
+            abs_pt->XRange = soap_new_req_tt__FloatRange(soap, PAN_MIN,  PAN_MAX);
+            abs_pt->YRange = soap_new_req_tt__FloatRange(soap, TILT_MIN, TILT_MAX);
+            options->Spaces->AbsolutePanTiltPositionSpace.push_back(abs_pt);
+        }
+        auto abs_z = soap_new_tt__Space1DDescription(soap);
+        if (abs_z) {
+            abs_z->URI    = "http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace";
+            abs_z->XRange = soap_new_req_tt__FloatRange(soap, ZOOM_MIN, ZOOM_MAX);
+            options->Spaces->AbsoluteZoomPositionSpace.push_back(abs_z);
+        }
+    }
+    options->PTZTimeout = soap_new_req_tt__DurationRange(soap, 1000, 60000);
+    tptz__GetConfigurationOptionsResponse.PTZConfigurationOptions = options;
+    return SOAP_OK;
+}
+
+int PTZBindingService::GetCompatibleConfigurations(
+    _tptz__GetCompatibleConfigurations* tptz__GetCompatibleConfigurations,
+    _tptz__GetCompatibleConfigurationsResponse& tptz__GetCompatibleConfigurationsResponse)
+{
+    UNUSED(tptz__GetCompatibleConfigurations);
+    auto ctx = (ServiceContext*)soap->user;
+    for (auto& p : ctx->get_profiles()) {
+        tt__PTZConfiguration* cfg = p.second.get_ptz_cfg(soap);
+        if (cfg) tptz__GetCompatibleConfigurationsResponse.PTZConfiguration.push_back(cfg);
+    }
+    return SOAP_OK;
+}
+
+SOAP_EMPTY_HANDLER(PTZBindingService, tptz, SendAuxiliaryCommand)
+SOAP_EMPTY_HANDLER(PTZBindingService, tptz, GetPresetTours)
+SOAP_EMPTY_HANDLER(PTZBindingService, tptz, GetPresetTour)
+SOAP_EMPTY_HANDLER(PTZBindingService, tptz, GetPresetTourOptions)
+SOAP_EMPTY_HANDLER(PTZBindingService, tptz, CreatePresetTour)
+SOAP_EMPTY_HANDLER(PTZBindingService, tptz, ModifyPresetTour)
+SOAP_EMPTY_HANDLER(PTZBindingService, tptz, OperatePresetTour)
+SOAP_EMPTY_HANDLER(PTZBindingService, tptz, RemovePresetTour)

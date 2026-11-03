@@ -1,0 +1,20 @@
+[Unit]
+Description=ONVIF SERVER service (server side)
+# 네트워크 준비 후 기동 — 127.0.0.1로 먼저 떴다가 IP 확정 시 재시작(R/S 중복)되는 것 방지
+Wants=network-online.target
+After=syslog.target network.target network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ptz
+ExecStart=/home/ptz/edge/onvif_start.sh
+TimeoutSec=4
+User=root
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=5
+StartLimitBurst=0
+
+[Install]
+WantedBy=multi-user.target

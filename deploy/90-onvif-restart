@@ -1,0 +1,50 @@
+#!/bin/bash
+# NetworkManager dispatcher: ONVIF가 쓰는 IP가 실제로 바뀐 경우에만 ONVIF/WS-Discovery 재시작
+# 설치 위치: /etc/NetworkManager/dispatcher.d/90-onvif-restart (root:root 755)
+#
+# onvif_srvd는 시작할 때마다 모터 MCU에 R/S 초기화 명령을 보낸다(재정렬, 2~3초 소요).
+# 예전에는 lo/eth0/eth1 up, dhcp4-change 이벤트마다 무조건 재시작해서
+# 부팅 중 R/S가 4~5회, 정렬이 끝나기 전에 반복되어 모터가 들썩/떨렸다. (INCIDENT-261027)
+
+IFACE="$1"
+ACTION="$2"
+
+case "$ACTION" in
+    up|dhcp4-change) ;;
+    *) exit 0 ;;
+esac
+[ "$IFACE" = "lo" ] && exit 0
+
+sleep 1  # IP 안정화 대기
+
+# 기동 스크립트 경로는 유닛의 ExecStart에서 읽는다 (/home/ptz, /home/poe 등 장비별 상이)
+START=$(systemctl show -P ExecStart onvif_srvd 2>/dev/null | grep -oP 'path=\K[^ ;]+' | head -1)
+
+# --detect를 모르는 구버전 기동 스크립트를 호출하면 onvif_srvd가 하나 더 떠서
+# 시리얼을 이중 점유하고 R/S가 나간다. 지원할 때만 호출한다.
+if [ -z "$START" ] || ! grep -q -- '--detect' "$START" 2>/dev/null; then
+    logger -t nm-onvif "[$ACTION] $IFACE — 기동 스크립트($START)가 --detect 미지원, 재시작 생략"
+    exit 0
+fi
+
+NEW_IP=$("$START" --detect)
+OLD_IP=$(cat /run/onvif_srvd.ip 2>/dev/null)
+
+if [ -z "$NEW_IP" ]; then
+    logger -t nm-onvif "[$ACTION] $IFACE — IP 감지 실패, 재시작 생략"
+    exit 0
+fi
+
+# 아직 한 번도 안 떴으면 systemd가 띄움 (그때 최신 IP 사용)
+if [ -z "$OLD_IP" ]; then
+    logger -t nm-onvif "[$ACTION] $IFACE — ONVIF 미기동 상태, 재시작 생략 (IP=$NEW_IP)"
+    exit 0
+fi
+
+if [ "$NEW_IP" = "$OLD_IP" ]; then
+    logger -t nm-onvif "[$ACTION] $IFACE — IP 동일($NEW_IP), 재시작 생략"
+    exit 0
+fi
+
+logger -t nm-onvif "[$ACTION] $IFACE — IP 변경 $OLD_IP → $NEW_IP, ONVIF 서비스 재시작"
+systemctl try-restart onvif_srvd wsdd

@@ -1,0 +1,47 @@
+# 데이터·모델·영상 (NAS·현장 PC 에 둔다)
+data/
+datasets/
+runs/
+outputs/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.hef
+*.mp4
+*.avi
+*.mkv
+*.zip
+*.tar
+*.npz
+*.npy
+
+# 실행 부산물
+__pycache__/
+*.pyc
+*.log
+.venv/
+venv/
+node_modules/
+.DS_Store
+Thumbs.db
+
+
+# --- 2026_ONVIF_SRVD 에서 가져온 항목 ---
+# 빌드 산출물
+build/
+build_simple/
+*.o
+*.so
+onvif_srvd
+!tools/
+# 백업/임시
+*.bak
+*.bak_*
+*.new
+*~
+# 대용량 원본 (배포는 빌드로)
+*.pdf
+
+# 배포 묶음 출력 (tools/make_package.py)
+dist/
