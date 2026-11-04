@@ -84,7 +84,7 @@ onvif_srvd는 시리얼을 읽지 않으므로 별도 프로세스에서 **읽�
 
 ### 3.5 11/02 재조회 (IP <ptz018-ip>로 변경됨, 가동 42분)
 
-선임 제공 조회 스크립트(`I` 송신)로 확인. 10/29 값과 **전부 동일**:
+제공받은 조회 스크립트(`I` 송신)로 확인. 10/29 값과 **전부 동일**:
 
 ```
 [pan] v2.3.0-manual — Measured Yes, PAN, vel PID 6/5/0, Tf 0.01, angle P 20, vel limit 3, voltage limit 8, align V 3,
