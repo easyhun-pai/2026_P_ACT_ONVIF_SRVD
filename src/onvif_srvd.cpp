@@ -501,6 +501,46 @@ void check_service_ctx(void)
 
 
 
+// MK3: WS-Security 헤더 허용 (2026-11-05)
+// ONVIF Device Manager·NVR 은 계정을 wsse:Security 헤더(mustUnderstand="1")로 보낸다.
+// 이 빌드는 WSSE 플러그인 없이 만들어서 gSOAP 이 그 헤더를 모르고 MustUnderstand fault 로 모든 요청을 거부했다.
+// 1단계: wsse:Security 만 '이해한 것으로' 넘긴다 (계정 확인은 하지 않음 - 지금도 ONVIF 는 계정 검사가 없다).
+// 그 밖의 모르는 mustUnderstand 헤더는 지금처럼 fault, mustUnderstand 아닌 모르는 요소는 지금처럼 무시.
+static bool is_wsse_security(struct soap *soap, const char *tag)
+{
+    const char *local = strchr(tag, ':');
+    local = local ? local + 1 : tag;
+    if(strcmp(local, "Security") != 0)
+        return false;
+
+    const char *ns = soap_current_namespace_tag(soap, tag);
+    return ns && strstr(ns, "secext") != NULL;   // OASIS wss 2004/01 ...-secext-1.0.xsd, 구 2002/07 secext
+}
+
+
+
+static int mk3_fignore(struct soap *soap, const char *tag)
+{
+    if(!soap->mustUnderstand)
+        return SOAP_OK;                          // 예전과 같음: 모르는 요소는 건너뜀
+
+    if(soap->part == SOAP_IN_HEADER && is_wsse_security(soap, tag))
+    {
+        static bool logged = false;
+        if(!logged)
+        {
+            logged = true;
+            fprintf(stderr, "ONVIF: WS-Security header accepted (credentials not checked)\n");
+            fflush(stderr);
+        }
+        return SOAP_OK;
+    }
+
+    return SOAP_MUSTUNDERSTAND;                  // 예전과 같음
+}
+
+
+
 void init_gsoap(void)
 {
     soap = soap_new();
@@ -508,6 +548,7 @@ void init_gsoap(void)
     if(!soap)
         daemon_error_exit("Can't get mem for SOAP\n");
 
+    soap->fignore = mk3_fignore;   // MK3: WS-Security 헤더 허용
 
     soap->bind_flags = SO_REUSEADDR;
 

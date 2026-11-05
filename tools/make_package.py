@@ -27,6 +27,11 @@ FILES = {
     "device/onvif_setup/onvif_cam_view.py": "tools/onvif_setup/onvif_cam_view.py",
     "device/onvif_setup/onvif_pan_tilt.py": "tools/onvif_setup/onvif_pan_tilt.py",
     "device/onvif_setup/onvif_move.py": "tools/onvif_setup/onvif_move.py",
+    "device/onvif_setup/onvif_zoom_test.py": "tools/onvif_setup/onvif_zoom_test.py",
+    "device/onvif_setup/onvif_stream_test.py": "tools/onvif_setup/onvif_stream_test.py",
+    "device/onvif_setup/onvif_wsse_test.py": "tools/onvif_setup/onvif_wsse_test.py",
+    "docs/PTZ_STREAMING.md": "docs/PTZ_STREAMING.md",
+    "docs/WSSE.md": "docs/WSSE.md",
     "device/onvif_setup/README.txt": "tools/onvif_setup/README.txt",
     "src/ServicePTZ.cpp": "src/ServicePTZ.cpp",
     "src/onvif_srvd.cpp": "src/onvif_srvd.cpp",
@@ -41,7 +46,8 @@ FILES = {
 }
 EXEC = {"device/onvif_srvd", "device/onvif_start.sh",
         "device/onvif_setup/onvif_cam_view.py", "device/onvif_setup/onvif_pan_tilt.py",
-        "device/onvif_setup/onvif_move.py"}
+        "device/onvif_setup/onvif_move.py", "device/onvif_setup/onvif_zoom_test.py",
+        "device/onvif_setup/onvif_stream_test.py", "device/onvif_setup/onvif_wsse_test.py"}
 
 INSTALL_TXT = """ONVIF mk3-basic 장비 설치 (장비에서 실행, 인터넷 불필요)
 

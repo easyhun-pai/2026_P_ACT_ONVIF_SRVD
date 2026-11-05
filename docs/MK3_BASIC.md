@@ -10,7 +10,7 @@
 | 변경 파일 | `src/ServicePTZ.cpp`, `src/onvif_srvd.cpp`, `src/CMakeLists.txt` (`src/mk3-basic.patch` 한 장으로도 적용) |
 | gsoap | 시스템 2.8.124 (`-DUSE_SYSTEM_GSOAP=1`) |
 | 검증 장비 | ptz018 (Raspberry Pi CM5, Debian 12, PAN v2.3.0-manual / TILT v1.0.6) |
-| 검증 빌드 md5 | `2a450e4c1429904c67a9a242261636a8` (`mk3-basic 2026-11-03g`) |
+| 검증 빌드 md5 | `2a450e4c1429904c67a9a242261636a8` (`mk3-basic 2026-11-03g`), 줌 수정 `a6856dac39b085ec5d1d8da20d1d6a19` (`mk3-basic 2026-11-04 zoomfix`) |
 
 ## 원본과 같은 것
 
@@ -40,6 +40,9 @@ v8 guard(스톨 가드, 래치, 잠금, 한계 학습, 부팅 자동 복원, 자
 | 11 | 단발 이동은 작은 `T` 를 연속 전송(램프). AbsoluteMove `Speed`(0~1) 지원 | 큰 단발 `T` 는 구동 안 됨 ([HARDWARE.md](HARDWARE.md) 3절) |
 | 12 | `onvif_start.sh` IP 자동 선택에서 eth1/br-sensor 제외 | DHCP 실패 시 내부망 IP 로 뜨던 문제 |
 | 13 | 장비가 출력하는 문구는 모두 ASCII | PC 운영체제·터미널 종류와 무관 |
+| 14 | **줌 위치를 줌카메라에서 읽음** (2026-11-04) — 0.5초마다 백그라운드로 줌카메라 GetStatus(`Position/Zoom@x`). SetPreset·SetHomePosition·RelativeMove(줌)는 그 자리에서 한 번 더 읽음(1초 제한, 무응답 중이면 마지막 값) | 웹·edge·NVR 이 줌카메라를 직접 움직이면 onvif 의 줌이 0 에 머물러 프리셋이 1배로 저장되던 문제. ONVIF 요청은 한 스레드에서 처리되므로 요청 안에서 줌카메라를 기다리지 않게 함 |
+| 15 | 홈 위치를 `/var/lib/onvif_srvd/home.txt` 에 저장 | 재시작하면 홈이 사라지던 문제 |
+| 16 | 줌카메라 계정: env `ZOOM_CAM_USER`/`ZOOM_CAM_PASS` > `mediamtx.yml` `detection_zoom` 주소 (edge `zoom_camera.credentials()` 와 같은 순서). 소스에서 계정 삭제, 못 찾으면 줌 제어 끔 + `PTZ-ALERT` | 장비마다 계정이 다를 수 있음, 소스에 비밀번호 노출 |
 
 ## 시작 흐름
 
@@ -99,6 +102,23 @@ ptz_init
 | 기동 시 고개를 들어 올리며 떨림 | MCU 가 `S` 후 0,0 으로 이동 | `S` 직후 현재 자세 연속 전송 |
 | 콜드부팅 후 첫 onvif 재시작에 `S` 재전송 | `/run/onvif_srvd/` 폴더가 없어 시작 표식 미기록 | 표식 전에 폴더 생성, 실패 시 `PTZ-ALERT` |
 | 콜드부팅 때 팬이 0° 까지 108° 회전 | 바퀴 누적 각도를 그대로 범위 비교 → 유지 실패 | 각도를 [−π, π] 로 접음 |
+
+## 줌 위치 시험 (ptz018, 2026-11-04, 빌드 md5 `a6856dac`)
+
+| 시험 | 결과 |
+|---|---|
+| 웹 줌 3배 → ONVIF GetStatus | 0.221 |
+| ONVIF SetPreset → presets.txt | 0.221 |
+| 웹 1배 → ONVIF GotoPreset → 줌카메라 | 0.220 (복귀) |
+| 연속 줌 뒤 RelativeMove +0.1 | 0.653 → 0.702 (튐 없음) |
+| SetHomePosition → 재시작 | home.txt 에서 다시 읽음 |
+| GetStatus 응답 | 약 0.4 ms |
+| 줌카메라 차단(약 10초) | GetStatus 3 ms, SetPreset 1 ms, `PTZ-ALERT` 1회 → 회복 로그 |
+| 계정 없음(mediamtx.yml 없음) | 줌 제어 꺼짐 + `PTZ-ALERT`, 모터 쪽은 정상 시작 |
+| 설치 시 모터 | 명령 0건 |
+
+줌카메라(UV-ZNH4110M)는 Digest 전용 curl 요청(빈 본문 탐색 POST)에 인증 요구 없이 200 을 돌려줘서 본 요청이 401 이 된다.
+인증 방식 자동(`CURLAUTH_ANY`) + 요청마다 새 핸들로 처리한다 — 핸들을 재사용하지 말 것.
 
 ## 주의
 

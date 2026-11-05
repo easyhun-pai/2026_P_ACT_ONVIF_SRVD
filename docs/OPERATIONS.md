@@ -9,7 +9,9 @@
 | `position.txt` | 마지막 위치 `pan tilt zoom` (라디안) | 기록용. 시작 시 위치는 MCU 목표각으로 맞춘다 |
 | `mcu_offset` | 축별 센서 offset (`pan 5.68` / `tilt 3.35`) | 기동 중 읽은 값. 콜드부팅 때 처진 자세 각도 계산에 사용. 지우면 다음 기동 때 다시 기록 |
 | `mount_mode` | `stand` / `hang` | `hang` 이면 tilt 부호 반전. 없으면 `stand` |
-| `presets.txt` | ONVIF 프리셋 | |
+| `presets.txt` | ONVIF 프리셋 | 줌은 저장 순간 줌카메라에서 읽은 실제 값 |
+| `home.txt` | 홈 위치 `pan tilt zoom` | SetHomePosition 때 기록, 시작 시 읽음 |
+| `ptz_watch.conf` | 이동 감시 설정 (`key = value`, 없으면 기본값) | [PTZ_STREAMING.md](PTZ_STREAMING.md) |
 | `device_id` | 장치 식별자 (MQTT 토픽) | |
 | `tracking_lock` | 있으면 ONVIF 이동 명령 무시 | 추적 기능이 잡고 있을 때 |
 
@@ -50,7 +52,10 @@ sudo fuser -v /dev/ttyAMA0 /dev/ttyAMA2
 | `PTZ-CMD:` | 모터에 보낸 명령과 이유 (`none` = 보내지 않음) |
 | `PTZ-MCU:` | 우리 `S` 직후 모터 보드 메시지 (`MOT: Init`, `Motor ready` 등) |
 | `PTZ-MON:` | 기동 후 30초, 1초마다 목표/현재 각도 |
-| `PTZ-ALERT:` | 이상 — 보드 자체 재부팅, 우리 `S` 없이 나온 보드 메시지, 모터 꺼짐, 목표 미유지, 무응답. **자동 재시도 없음** |
+| `PTZ-ALERT:` | 이상 — 보드 자체 재부팅, 우리 `S` 없이 나온 보드 메시지, 모터 꺼짐, 목표 미유지, 무응답, 줌카메라 조회 실패·계정 없음. **자동 재시도 없음** |
+| `PTZ: arrived ...` / `PTZ-ALERT: NOT_REACHED·DRIFT·CORRECTION_FAILED` | 이동 감시 결과 ([PTZ_STREAMING.md](PTZ_STREAMING.md)), 바뀔 때만 |
+| `ONVIF: WS-Security header accepted (credentials not checked)` | ODM·NVR 이 계정을 붙여 접속함 (실행 후 처음 한 번) ([WSSE.md](WSSE.md)) |
+| `PTZ: zoom camera ...` | 줌카메라 주소·계정 출처(`account from ...`), 조회 `OK` / `OK again` (실패는 `PTZ-ALERT`, 끊길 때 한 번) |
 
 ## 장비 시험 도구 (`/home/ptz/workspace/onvif_setup`)
 
@@ -61,6 +66,7 @@ python3 ~/workspace/onvif_setup/onvif_cam_view.py          # PC 브라우저 htt
 python3 ~/workspace/onvif_setup/onvif_pan_tilt.py --quick  # 팬/틸트 시험 약 25초 (전체는 옵션 없이 약 2분)
 python3 ~/workspace/onvif_setup/onvif_pan_tilt.py --quick --video
 python3 ~/workspace/onvif_setup/onvif_move.py 0 90        # 팬 0°, 틸트 90°로 이동 (기본 단위 도, --rad, --preset N, --list)
+sudo python3 ~/workspace/onvif_setup/onvif_zoom_test.py   # 줌 위치 시험 — 줌 3배/1배로 움직이고 시험 프리셋 ztest 를 만들었다 지움, 끝나면 줌 복귀
 ```
 
 `onvif_pan_tilt.py`, `onvif_move.py` 는 ONVIF 로 움직이므로 onvif 를 멈출 필요가 없다.

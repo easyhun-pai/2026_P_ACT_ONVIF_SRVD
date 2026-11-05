@@ -45,3 +45,6 @@ onvif_srvd
 
 # 배포 묶음 출력 (tools/make_package.py)
 dist/
+
+# 개인 작업 폴더 (참고자료·할 일·데이터, 커밋 안 함)
+_workspace/

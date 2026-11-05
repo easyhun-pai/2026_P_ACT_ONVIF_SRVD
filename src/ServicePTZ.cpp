@@ -18,9 +18,23 @@
    4. 시작 시 MCU 목표각으로 위치 동기화 (position.txt 불일치 해소, 자동 이동 없음)
    5. 모터 명령 이력 로그 ("PTZ-CMD:" 접두사, stderr -> journal)
    6. 펌웨어가 한계각을 알려주면(v2.3.0 'I') 스펙 한계와 교집합으로 클램프
+   7. 줌 위치를 줌카메라에서 읽는다 (2026-11-04, 요청서 onvif_줌위치_수정요청_2026-11-03)
+      - 웹/edge ptz_api/NVR 이 줌카메라를 직접 움직여도 GetStatus·SetPreset 이 실제 줌을 쓴다
+      - 0.5초마다 백그라운드로 줌카메라 GetStatus (ONVIF 요청 처리는 한 스레드라 그 안에서 기다리지 않음)
+      - SetPreset/SetHomePosition/RelativeMove 는 그 자리에서 한 번 더 읽는다 (실패하면 마지막 값)
+      - 홈 위치를 home.txt 에 저장 (재시작 뒤 유지)
+      - 줌카메라 계정: env ZOOM_CAM_USER/ZOOM_CAM_PASS > mediamtx.yml detection_zoom (소스에 계정 없음, 못 찾으면 줌 끔)
+   8. 스트리밍 모드 (2026-11-04, 요청서 PTZ_스트리밍모드_요청_2026-11-04)
+      - 마지막 이동 목표를 기억하고 실측(엔코더)과 비교: 도착 확인(NOT_REACHED), 도착 뒤 틀어짐(DRIFT)
+      - GetStatus: Position = 실측, MoveStatus = MOVING/IDLE, Error = NOT_REACHED/DRIFT/MOTOR_OFF/NO_REPLY/CORRECTION_FAILED
+      - 자동 보정(기본 꺼짐): 느린 램프로 최대 correct_max 번, 간격 correct_gap_s, 실패하면 포기
+      - 설정 /var/lib/onvif_srvd/ptz_watch.conf (key=value), live 파일에 watch 줄
+   9. 모터 펌웨어 v2.4+ (라이다 신규 v2.5.1) 기동 판정 (2026-11-04)
+      - v2.5.1 은 꺼져 있어도 Sensor offset 을 보고 -> 'Q' 상태의 켜짐 비트로 판정 (구 펌웨어는 기존 offset 판정)
+      - 켜짐 비트(0x0001)는 가정. 틀리면 안전 쪽(꺼짐 판정 -> S + 자세 유지), 기동 후 스스로 검증해 로그
 
  Pan/Tilt : /dev/ttyAMA0, /dev/ttyAMA2 (115200, 'T<rad>\n')
- Zoom     : 192.168.1.68 ONVIF SOAP 직접 호출
+ Zoom     : 줌카메라(기본 192.168.1.68) ONVIF SOAP 직접 호출
 -----------------------------------------------------------------------------
 */
 
@@ -41,6 +55,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <stdlib.h>
@@ -102,14 +117,21 @@ static const int   HEALTH_PERIOD_MS    = 500;   // 운영 중 상태 조회 주�
 static const float NOT_HOLDING_RAD     = 0.30f; // 정지 중 |현재-목표|가 이보다 크면 '유지 못함'
 
 // Zoom 카메라
-static const char* ZOOM_CAM_USERPWD = "admin:CHANGE_ME"   /* 실제 계정은 배포 시 설정 (공개본에서 제거) */;
+// 접속 정보: env ZOOM_CAM_USER/ZOOM_CAM_PASS > mediamtx.yml 의 detection_zoom RTSP 주소 (edge zoom_camera.credentials() 와 같은 순서)
+// 소스에 계정을 두지 않는다. 둘 다 없으면 줌 제어를 끄고 PTZ-ALERT 만 남긴다.
+static const char* ZOOM_CAM_HOST_DEFAULT = "192.168.1.68";   // env 계정만 있고 mediamtx.yml 이 없을 때의 줌카메라 주소
 static const char* ZOOM_CAM_TOKEN   = "ONFProfileToken_101";
-static const char* ZOOM_CAM_URL     = "http://192.168.1.68/onvif/ptz_service";
+static const char* MEDIAMTX_YML_PATHS[] = { "/home/ptz/edge/mediamtx.yml", "/home/poe/edge/mediamtx.yml" };
+static const int   ZOOM_POLL_MS        = 500;    // 백그라운드 줌 조회 주기
+static const long  ZOOM_POLL_TIMEOUT_MS = 1500;
+static const long  ZOOM_FRESH_TIMEOUT_MS = 1000; // SetPreset 등에서 그 자리 조회
+static const long  ZOOM_CMD_TIMEOUT_MS  = 3000;  // 줌 이동 명령
 
 // 저장 위치
 static const char* PRESET_DB_DIR      = "/var/lib/onvif_srvd";
 static const char* PRESET_DB_PATH     = "/var/lib/onvif_srvd/presets.txt";
 static const char* POSITION_DB_PATH   = "/var/lib/onvif_srvd/position.txt";
+static const char* HOME_DB_PATH       = "/var/lib/onvif_srvd/home.txt";      // 홈 위치 pan tilt zoom
 static const char* TRACKING_LOCK_PATH = "/var/lib/onvif_srvd/tracking_lock";
 static const char* MOUNT_MODE_PATH    = "/var/lib/onvif_srvd/mount_mode";
 static const char* OFFSET_DB_PATH     = "/var/lib/onvif_srvd/mcu_offset";   // 축별 Sensor offset (기동 중 읽은 값)
@@ -272,6 +294,9 @@ struct AxisInfo {
     std::string action;           // 시작 시 한 일
     float start_target = 0;       // 시작 후 MCU 목표각
     bool  start_target_ok = false;
+    bool  has_q = false;          // 펌웨어가 'Q' 상태 조회를 지원 (v2.4.0 이상)
+    bool  q_ok = false;           // 시작 판정 때 Q 응답을 읽었음
+    uint16_t q_flags = 0;
     AxisInfo(const char* n, const char* p) : name(n), port(p) {}
 };
 static AxisInfo g_ax[2] = { AxisInfo("pan", PAN_PORT), AxisInfo("tilt", TILT_PORT) };
@@ -386,6 +411,59 @@ static void query_version(AxisInfo& a) {
     for (const auto& l : r) if (!l.empty() && l[0] == 'v') { a.version = l; break; }
 }
 
+// ===== 모터 보드 'Q' 상태 (펌웨어 v2.4.0 이상) =====
+// 왜 필요한가: v2.5.1 은 모터가 꺼져 있어도 Sensor offset(EEPROM 저장값)을 보고한다 -> 'offset 0 = 꺼짐' 판정이 안 된다
+// (poe002 2026-11-04: 'T' 는 offset 4.07, 제조사 kestrel_status.py 는 'off', 인가 전압 0).
+// 응답: "Q" + 16진 64자 = 32바이트 little-endian 레코드, 끝 2바이트 = 앞 30바이트의 CRC-16/CCITT-FALSE
+//   [0] 형식 [1] 순번 [2..3] 플래그 [4..5] 목표 mrad [6..7] 현재 mrad [12..13] 전압 제한 mV [14..15] 모터 추정 온도 0.01C
+//   [18..19] 실내 0.01C [20..21] 과열 차단 0.01C [26..29] 가동 ms   (poe002 v2.5.1 실측 3건, CRC 일치)
+// 켜짐(동작) 비트: 제조사 문서를 못 봐서 0x0001 로 가정 (꺼진 상태 실측 플래그 0x0186 에서 0).
+//   가정이 틀리면 '항상 꺼짐'으로 판정 -> 재시작 때 S + 지금 자세 유지 (안전, 짧은 움찔만).
+//   우리가 켠 뒤에도 0 이면 가정이 틀린 것 -> 그 축은 Q 로 하는 '모터 꺼짐' 감시를 끈다 (g_qbit, 오경보 방지).
+static uint16_t Q_RUN_BIT = 0x0001;   // ptz_watch.conf 의 q_run_bit = 0x.... 로 바꿀 수 있음 (실장비 확인 후)
+static std::atomic<int> g_qbit[2];   // 0 미확인, 1 확인(켜진 상태에서 비트 1 을 봄), 2 틀림(켰는데 0)
+
+static uint16_t crc16_ccitt_false(const uint8_t* d, size_t n) {
+    uint16_t c = 0xFFFF;
+    for (size_t i = 0; i < n; ++i) {
+        c ^= (uint16_t)d[i] << 8;
+        for (int k = 0; k < 8; ++k) c = (c & 0x8000) ? (uint16_t)((c << 1) ^ 0x1021) : (uint16_t)(c << 1);
+    }
+    return c;
+}
+
+// "Q0100860110FF..." 한 줄 -> 플래그/목표/현재. CRC 가 틀리면 false
+static bool parse_q_line(const std::string& l, uint16_t& flags, float& tgt, float& cur) {
+    size_t p = l.find('Q');
+    if (p == std::string::npos || l.size() < p + 65) return false;
+    uint8_t b[32];
+    for (int i = 0; i < 32; ++i) {
+        char h[3] = { l[p + 1 + 2 * i], l[p + 2 + 2 * i], 0 };
+        if (!isxdigit((unsigned char)h[0]) || !isxdigit((unsigned char)h[1])) return false;
+        b[i] = (uint8_t)strtol(h, nullptr, 16);
+    }
+    if (crc16_ccitt_false(b, 30) != (uint16_t)(b[30] | (b[31] << 8))) return false;
+    flags = (uint16_t)(b[2] | (b[3] << 8));
+    tgt = (int16_t)(b[4] | (b[5] << 8)) / 1000.0f;
+    cur = (int16_t)(b[6] | (b[7] << 8)) / 1000.0f;
+    return true;
+}
+
+static bool fw_has_q(const std::string& v) {   // "v2.5.1-manual" -> true (v2.4.0 이상)
+    int ma = 0, mi = 0;
+    if (sscanf(v.c_str(), "v%d.%d", &ma, &mi) != 2) return false;
+    return ma > 2 || (ma == 2 && mi >= 4);
+}
+
+static void query_q(AxisInfo& a) {
+    a.q_ok = false;
+    if (!a.has_q) return;
+    std::vector<std::string> r = serial_ask(a.fd, "Q", "Q", QUERY_TIMEOUT_MS);
+    float t, c;
+    for (const auto& l : r)
+        if (parse_q_line(l, a.q_flags, t, c)) { a.q_ok = true; break; }
+}
+
 // 주의: v2.3.0은 'I'를 받으면 미기동 상태에서도 Sensor offset을 채운다 (11/02 실측).
 //       그래서 'I'는 반드시 상태 판정('T') 뒤에만 보낸다.
 static void query_info(AxisInfo& a) {
@@ -403,22 +481,29 @@ static void query_info(AxisInfo& a) {
     }
 }
 
+// 기동(arm) 판정
+//  - Q 지원 펌웨어(v2.4+): Q 의 켜짐 비트 + 목표 유지. Q 를 못 읽으면 '모름' -> 꺼짐으로 보고 S (안전 쪽)
+//  - 구 펌웨어(v2.3.0, v1.0.6): offset 0 = 꺼짐 (기존 실측)
 static bool judge_armed(const AxisInfo& a) {
-    return a.state_ok && a.off_known && fabsf(a.off) > OFFSET_ZERO_EPS &&
-           fabsf(wrapd(a.cur - a.tgt)) < ARMED_ERR_RAD;
+    if (!a.state_ok || fabsf(wrapd(a.cur - a.tgt)) >= ARMED_ERR_RAD) return false;
+    if (a.has_q) return a.q_ok && (a.q_flags & Q_RUN_BIT);
+    return a.off_known && fabsf(a.off) > OFFSET_ZERO_EPS;
 }
 
 static std::string state_str(const AxisInfo& a) {
     if (!a.state_ok) return "unknown (no 'T' reply)";
-    char b[160];
+    char b[220];
     // offset이 있으면 current는 각도(바퀴 누적 가능) -> 한 바퀴 안으로 접어서, 원래 값도 같이 표시
     bool angle = a.off_known && fabsf(a.off) > OFFSET_ZERO_EPS;
     char cur[64];
     if (angle && fabsf(wrapd(a.cur) - a.cur) > 0.01f) snprintf(cur, sizeof(cur), "%.2f [raw %.2f]", wrapd(a.cur), a.cur);
     else snprintf(cur, sizeof(cur), "%.2f", a.cur);
-    snprintf(b, sizeof(b), "%s (target %.2f, current %s, offset %s)",
+    char q[32] = "";
+    if (a.has_q) { if (a.q_ok) snprintf(q, sizeof(q), ", Q 0x%04x %s", a.q_flags, (a.q_flags & Q_RUN_BIT) ? "on" : "off");
+                   else snprintf(q, sizeof(q), ", Q no reply"); }
+    snprintf(b, sizeof(b), "%s (target %.2f, current %s, offset %s%s)",
              judge_armed(a) ? "armed" : "not armed", a.tgt, cur,
-             a.off_known ? std::to_string(a.off).substr(0, 5).c_str() : "?");
+             a.off_known ? std::to_string(a.off).substr(0, 5).c_str() : "?", q);
     return b;
 }
 
@@ -491,7 +576,57 @@ static void send_serial_pt() {
 // AbsoluteMove에 Speed(0~1)가 오면 그 비율로: 1.0 = 팬 3.0 rad/s, 틸트 1.5 rad/s (펌웨어 velocity limit 3.0)
 static const float GOTO_MAX_STEP_PAN  = 0.060f;
 static const float GOTO_MAX_STEP_TILT = 0.030f;
+// ===== 스트리밍 모드: 목표 기억 / 도착 확인 / 틀어짐 감시 / 제한된 보정 (2026-11-04) =====
+// 명령을 던지고 끝내지 않고, 마지막 이동 목표를 기억해 실측(엔코더)과 비교한다.
+// 판정은 health 스레드(0.5초)에서, 결과는 GetStatus(Position=실측, MoveStatus, Error)와 로그로 나간다.
+// 수치 기본값: ptz018 실측 정지 오차 팬 0.2°, 틸트 최대 1.4° + MCU 보고 단위 0.01 rad(0.57°) -> 도착 2°, 틀어짐 3°.
+struct WatchCfg {
+    float arrive_tol_deg   = 2.0f;
+    float arrive_timeout_s = 10.0f;   // 램프가 끝난 뒤 이 시간 안에 못 들어오면 NOT_REACHED
+    float drift_tol_deg    = 3.0f;
+    float drift_hold_s     = 3.0f;    // 도착 뒤 drift_tol 초과가 이만큼 이어지면 DRIFT
+    bool  correct          = false;   // 자동 보정 (기본 꺼짐 - 경고만)
+    int   correct_max      = 2;       // 한 목표당 최대 보정 횟수, 넘으면 CORRECTION_FAILED 로 포기
+    float correct_gap_s    = 10.0f;
+    bool  status_real      = true;    // GetStatus Position: true=실측, false=예전처럼 명령값
+};
+static WatchCfg g_wcfg;
+static const char* WATCH_CFG_PATH = "/var/lib/onvif_srvd/ptz_watch.conf";
+enum WatchState { W_NONE = 0, W_MOVING, W_ARRIVED, W_NOT_REACHED, W_DRIFT, W_MOTOR_OFF, W_NO_REPLY, W_CORRECTION_FAILED };
+static const char* W_NAME[] = { "none", "moving", "arrived", "NOT_REACHED", "DRIFT", "MOTOR_OFF", "NO_REPLY", "CORRECTION_FAILED" };
+static std::mutex g_watch_mtx;
+static bool     g_goal_ok = false;
+static float    g_goal[2] = { 0, 0 };
+static int      g_wstate = W_NONE;
+static int      g_corr_count = 0;
+static uint64_t g_corr_last_us = 0;
+static uint64_t g_drift_since_us = 0;
+static uint64_t g_goal_set_us = 0;
+static bool     g_correcting = false;
+static float    g_werr[2] = { 0, 0 };          // 마지막 판정 때 축별 오차 (deg)
+static std::atomic<int>      g_ramp_running{0};
+static std::atomic<uint64_t> g_ramp_end_us{0};
+
+// 새 이동 목표 (AbsoluteMove/GotoPreset/GotoHome/RelativeMove/Stop/연속이동 정지)
+static void watch_set_goal(float p, float t) {
+    std::lock_guard<std::mutex> lk(g_watch_mtx);
+    g_goal[0] = p; g_goal[1] = t; g_goal_ok = true;
+    g_wstate = W_MOVING; g_corr_count = 0; g_correcting = false; g_drift_since_us = 0;
+    g_goal_set_us = now_us();
+}
+// 연속 이동 중에는 목표가 계속 바뀌므로 판정하지 않는다
+static void watch_continuous_moving() {
+    std::lock_guard<std::mutex> lk(g_watch_mtx);
+    g_goal_ok = false; g_wstate = W_MOVING; g_corr_count = 0; g_correcting = false;
+}
+
+struct RampGuard {   // 램프 스레드가 도는 동안 '이동 중', 끝난 시각 기록
+    RampGuard()  { g_ramp_running.fetch_add(1); }
+    ~RampGuard() { g_ramp_end_us.store(now_us()); g_ramp_running.fetch_sub(1); }
+};
+
 static void goto_ramp_thread_func(uint32_t gen, float sp, float st) {
+    RampGuard guard;
     float tp, tt;
     get_current_pt(tp, tt);
     float p = g_sent[0].load(), t = g_sent[1].load();
@@ -524,7 +659,9 @@ static void goto_current_pt(float speed) {
         sp = GOTO_MAX_STEP_PAN * s;
         st = GOTO_MAX_STEP_TILT * s;
     }
-    std::thread(goto_ramp_thread_func, gen, sp, st).detach();
+    { float gp, gt; get_current_pt(gp, gt); watch_set_goal(gp, gt); }
+    g_ramp_running.fetch_add(1);   // 스레드가 뜨기 전 틈에 '정지'로 판정되지 않게 (스레드의 RampGuard 와 짝)
+    std::thread([gen, sp, st]() { goto_ramp_thread_func(gen, sp, st); g_ramp_running.fetch_sub(1); }).detach();
     save_position_to_file();
     mqtt_publish_pose();
 }
@@ -545,6 +682,7 @@ static void continuous_move_thread_func() {
                 g_cont_pan_vel.store(0.0f);
                 g_cont_tilt_vel.store(0.0f);
                 save_position_to_file();
+                { float gp, gt; get_current_pt(gp, gt); g_ramp_end_us.store(now_us()); watch_set_goal(gp, gt); }
                 PTZ_LOG("PTZ: continuous auto-stop (no command for %.1fs)\n", elapsed / 1e6);
             } else if (!g_motion_enabled.load()) {
                 uint64_t n = now_us();
@@ -555,8 +693,10 @@ static void continuous_move_thread_func() {
             } else {
                 float tsign = is_hang_mode() ? -1.0f : 1.0f;
                 g_goto_gen.fetch_add(1);   // 진행 중 단발 램프 취소
+                watch_continuous_moving();
                 adjust_current_pt(vx * CONT_STEP_PAN, vy * tsign * CONT_STEP_TILT);
                 send_serial_pt();
+                g_ramp_end_us.store(now_us());
                 mqtt_publish_pose();
             }
         }
@@ -568,12 +708,19 @@ static void continuous_move_thread_func() {
 struct Telem {
     std::atomic<float>    tgt{0}, cur{0}, off{0};
     std::atomic<uint64_t> us{0};
+    std::atomic<uint32_t> qflags{0};      // 마지막 Q 플래그 (v2.4+)
+    std::atomic<uint64_t> q_us{0};
 };
 static Telem g_tel[2];
 static std::atomic<uint64_t> g_s_sent_us[2];   // 우리가 S를 보낸 시각 (직후 MOT 메시지는 정상)
 
 static void handle_mcu_line(int i, const std::string& l) {
     const char* nm = g_ax[i].name;
+    if (!l.empty() && l[0] == 'Q') {
+        uint16_t f; float qt, qc;
+        if (parse_q_line(l, f, qt, qc)) { g_tel[i].qflags.store(f); g_tel[i].q_us.store(now_us()); }
+        return;
+    }
     size_t p = l.find("Target angle");
     if (p != std::string::npos) {
         float t = 0, c = 0, o = 0;
@@ -638,6 +785,201 @@ static bool tel_query(int i, float& t, float& c, float& o, int timeout_ms = 500)
     return false;
 }
 
+// 수신 스레드가 도는 중의 Q 조회 (v2.4+)
+static bool q_query(int i, uint16_t& flags, int timeout_ms = 300) {
+    if (g_ax[i].fd < 0 || !g_ax[i].has_q) return false;
+    uint64_t t0 = now_us();
+    serial_write(g_ax[i].fd, "Q\n");
+    while (now_us() - t0 < (uint64_t)timeout_ms * 1000ULL) {
+        if (g_tel[i].q_us.load() > t0) { flags = (uint16_t)g_tel[i].qflags.load(); return true; }
+        usleep(10000);
+    }
+    return false;
+}
+
+// 모터가 꺼져 있나 (운영 중 감시용)
+//  - 구 펌웨어: offset 0
+//  - Q 펌웨어: 켜짐 비트가 확인된 축만 Q 로 판정. 확인 전/틀림이면 판정하지 않음
+//    (v2.5.1 은 꺼져도 offset 이 남아 offset 으로는 못 본다 -> 그 경우 꺼짐 감지 없음, 시작 로그에 남김)
+static std::atomic<bool> g_motor_off[2];
+static bool axis_motor_off(int i, float o) {
+    if (!g_ax[i].has_q) return fabsf(o) <= OFFSET_ZERO_EPS;
+    if (g_qbit[i].load() != 1) return false;
+    uint16_t f;
+    if (!q_query(i, f)) return false;     // 무응답은 T 쪽 감시가 따로 잡는다
+    return !(f & Q_RUN_BIT);
+}
+
+// 기동(S) 직후: 켜진 게 확실한 상태에서 Q 켜짐 비트 가정을 검증
+static void q_confirm_after_arm(int i) {
+    if (!g_ax[i].has_q || g_qbit[i].load() == 1) return;
+    uint16_t f = 0;
+    bool ok = false;
+    for (int k = 0; k < 3 && !ok; ++k) { ok = q_query(i, f); if (!ok) usleep(200000); }
+    if (ok && (f & Q_RUN_BIT)) {
+        g_qbit[i].store(1);
+        PTZ_LOG("PTZ: %s Q running bit confirmed (flags 0x%04x)\n", g_ax[i].name, f);
+        return;
+    }
+    g_qbit[i].store(2);
+    char why[32];
+    if (ok) snprintf(why, sizeof(why), "flags 0x%04x", f); else snprintf(why, sizeof(why), "no Q reply");
+    PTZ_LOG("PTZ-ALERT: %s Q running bit 0x%04x not set after arming (%s) - "
+            "motor-off detection disabled for this axis; next restart will send S again\n",
+            g_ax[i].name, Q_RUN_BIT, why);
+}
+
+// ===== 스트리밍 모드 판정 =====
+static void watch_load_cfg() {
+    std::ifstream f(WATCH_CFG_PATH);
+    std::string l;
+    while (f.is_open() && std::getline(f, l)) {
+        size_t h = l.find('#');
+        if (h != std::string::npos) l.erase(h);
+        size_t eq = l.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = l.substr(0, eq), v = l.substr(eq + 1);
+        k.erase(0, k.find_first_not_of(" \t")); k.erase(k.find_last_not_of(" \t") + 1);
+        v.erase(0, v.find_first_not_of(" \t")); v.erase(v.find_last_not_of(" \t\r") + 1);
+        float x = strtof(v.c_str(), nullptr);
+        if      (k == "arrive_tol_deg")   g_wcfg.arrive_tol_deg   = clampf(x, 0.3f, 30.0f);
+        else if (k == "arrive_timeout_s") g_wcfg.arrive_timeout_s = clampf(x, 1.0f, 120.0f);
+        else if (k == "drift_tol_deg")    g_wcfg.drift_tol_deg    = clampf(x, 0.5f, 60.0f);
+        else if (k == "drift_hold_s")     g_wcfg.drift_hold_s     = clampf(x, 0.5f, 120.0f);
+        else if (k == "correct")          g_wcfg.correct          = (v == "1" || v == "on" || v == "true");
+        else if (k == "correct_max")      g_wcfg.correct_max      = (int)clampf(x, 0, 10);
+        else if (k == "correct_gap_s")    g_wcfg.correct_gap_s    = clampf(x, 2.0f, 600.0f);
+        else if (k == "status_position")  g_wcfg.status_real      = (v != "target");
+        else if (k == "q_run_bit") { unsigned long b = strtoul(v.c_str(), nullptr, 0); if (b && b <= 0xFFFF) Q_RUN_BIT = (uint16_t)b; }
+        else PTZ_LOG("PTZ: %s: unknown key '%s' ignored\n", WATCH_CFG_PATH, k.c_str());
+    }
+    PTZ_LOG("PTZ: watch arrive %.1fdeg/%.0fs, drift %.1fdeg/%.1fs, correct %s (max %d, gap %.0fs), GetStatus position=%s, Q run bit 0x%04x%s\n",
+            g_wcfg.arrive_tol_deg, g_wcfg.arrive_timeout_s, g_wcfg.drift_tol_deg, g_wcfg.drift_hold_s,
+            g_wcfg.correct ? "on" : "off", g_wcfg.correct_max, g_wcfg.correct_gap_s,
+            g_wcfg.status_real ? "measured" : "target", Q_RUN_BIT, f.is_open() ? "" : " (defaults)");
+}
+
+static void watch_log_state(int ns, const char* why) {
+    const float D = 57.29578f;
+    if (ns == W_ARRIVED)
+        PTZ_LOG("PTZ: %s at (%.3f, %.3f), error pan %.1f tilt %.1f deg%s\n", why, g_goal[0], g_goal[1],
+                g_werr[0], g_werr[1], g_correcting ? " (after correction)" : "");
+    else if (ns == W_NOT_REACHED || ns == W_DRIFT || ns == W_CORRECTION_FAILED)
+        PTZ_LOG("PTZ-ALERT: %s - target (%.1f, %.1f) deg, error pan %.1f tilt %.1f deg%s\n", W_NAME[ns],
+                g_goal[0] * D, g_goal[1] * D, g_werr[0], g_werr[1], why);
+}
+
+// 보정: 실측 위치에서 목표까지 느린 램프를 다시 보낸다 (같은 T 를 다시 보내면 안 움직임 - HARDWARE.md 3절).
+// g_watch_mtx 를 잡은 채 부른다.
+static void watch_try_correct(const float c[2]) {
+    if (!g_wcfg.correct) return;
+    uint64_t now = now_us();
+    if (g_corr_count >= g_wcfg.correct_max) {
+        if (g_wstate != W_CORRECTION_FAILED) {
+            g_wstate = W_CORRECTION_FAILED;
+            watch_log_state(W_CORRECTION_FAILED, " - giving up, no more corrections for this target");
+        }
+        return;
+    }
+    if (g_corr_last_us && now - g_corr_last_us < (uint64_t)(g_wcfg.correct_gap_s * 1e6f)) return;
+    ++g_corr_count; g_corr_last_us = now; g_correcting = true;
+    for (int i = 0; i < 2; ++i) g_sent[i].store(g_goal[i] + wrapd(c[i] - g_goal[i]));   // 램프 시작 = 실측 (목표와 같은 바퀴)
+    set_current_pt(g_goal[0], g_goal[1]);
+    PTZ_LOG("PTZ-CMD: correction %d/%d - slow ramp from (%.3f, %.3f) back to (%.3f, %.3f)\n", g_corr_count, g_wcfg.correct_max,
+            g_sent[0].load(), g_sent[1].load(), g_goal[0], g_goal[1]);
+    g_wstate = W_MOVING; g_drift_since_us = 0;
+    uint32_t gen = g_goto_gen.fetch_add(1) + 1;
+    g_ramp_running.fetch_add(1);
+    std::thread([gen]() { goto_ramp_thread_func(gen, GOTO_MAX_STEP_PAN * 0.3f, GOTO_MAX_STEP_TILT * 0.3f); g_ramp_running.fetch_sub(1); }).detach();
+}
+
+static bool watch_moving() {
+    return g_ramp_running.load() > 0 || fabsf(g_cont_pan_vel.load()) >= 0.01f || fabsf(g_cont_tilt_vel.load()) >= 0.01f;
+}
+
+// health 스레드에서 0.5초마다. ok/c/o = 방금 조회한 축별 응답/현재각/offset
+static void watch_eval(const bool ok[2], const float c[2], const bool off[2]) {
+    if (!g_motion_enabled.load()) return;
+    bool moving = watch_moving();
+    std::lock_guard<std::mutex> lk(g_watch_mtx);
+    uint64_t now = now_us();
+    // 모터 꺼짐 / 무응답 - 기존 감시가 PTZ-ALERT 를 이미 남기므로 상태만 (보정 안 함, 자동 재시도 없음)
+    if (!ok[0] || !ok[1]) { g_wstate = W_NO_REPLY; return; }
+    if (off[0] || off[1]) { g_wstate = W_MOTOR_OFF; return; }
+    if (g_wstate == W_NO_REPLY || g_wstate == W_MOTOR_OFF) { g_wstate = W_MOVING; g_ramp_end_us.store(now); }
+    if (moving) { if (g_wstate != W_MOVING) g_wstate = W_MOVING; return; }
+    if (!g_goal_ok) {
+        // 연속 이동이 Stop 없이(속도 0 으로) 끝났다 -> 지금 명령 위치를 목표로
+        float gp, gt; get_current_pt(gp, gt);
+        g_goal[0] = gp; g_goal[1] = gt; g_goal_ok = true; g_wstate = W_MOVING; g_goal_set_us = now;
+        if (g_ramp_end_us.load() < now - 1000000ULL) g_ramp_end_us.store(now);
+        return;
+    }
+    const float D = 57.29578f;
+    for (int i = 0; i < 2; ++i) g_werr[i] = fabsf(wrapd(c[i] - g_goal[i])) * D;
+    float e = std::max(g_werr[0], g_werr[1]);
+    double since_end = (now - std::max(g_ramp_end_us.load(), g_goal_set_us)) / 1e6;
+    switch (g_wstate) {
+    case W_NONE:
+    case W_MOVING:
+        if (e <= g_wcfg.arrive_tol_deg) { watch_log_state(W_ARRIVED, "arrived"); g_wstate = W_ARRIVED; g_correcting = false; g_drift_since_us = 0; }
+        else if (since_end > g_wcfg.arrive_timeout_s) {
+            g_wstate = W_NOT_REACHED;
+            char why[64]; snprintf(why, sizeof(why), " (%.0fs after move)", since_end);
+            watch_log_state(W_NOT_REACHED, g_correcting ? " - correction did not converge" : why);
+            g_correcting = false;
+            watch_try_correct(c);
+        }
+        break;
+    case W_ARRIVED:
+        if (e > g_wcfg.drift_tol_deg) {
+            if (!g_drift_since_us) g_drift_since_us = now;
+            else if ((now - g_drift_since_us) / 1e6 >= g_wcfg.drift_hold_s) {
+                g_wstate = W_DRIFT;
+                watch_log_state(W_DRIFT, " (moved after arriving)");
+                watch_try_correct(c);
+            }
+        } else g_drift_since_us = 0;
+        break;
+    case W_NOT_REACHED:
+    case W_DRIFT:
+    case W_CORRECTION_FAILED:
+        if (e <= g_wcfg.arrive_tol_deg) { watch_log_state(W_ARRIVED, "back to normal"); g_wstate = W_ARRIVED; g_drift_since_us = 0; }
+        else if (g_wstate != W_CORRECTION_FAILED) watch_try_correct(c);
+        break;
+    }
+}
+
+// GetStatus 용: 실측 위치(움직이는 동안 MCU 가 계속 보내는 텔레메트리 포함, 2초 안 값), 이동 중 여부, 오류 사유
+static bool watch_status(float& pan, float& tilt, bool& moving, std::string& err) {
+    moving = watch_moving();
+    {
+        std::lock_guard<std::mutex> lk(g_watch_mtx);
+        if (g_wstate == W_MOVING) moving = true;
+        int s = g_wstate;
+        err = (s == W_NOT_REACHED || s == W_DRIFT || s == W_MOTOR_OFF || s == W_NO_REPLY || s == W_CORRECTION_FAILED) ? W_NAME[s] : "";
+    }
+    if (!g_wcfg.status_real) return false;
+    uint64_t now = now_us();
+    for (int i = 0; i < 2; ++i) {
+        uint64_t us = g_tel[i].us.load();
+        if (!us || now - us > 2000000ULL || g_motor_off[i].load()) return false;
+    }
+    pan  = wrapd(g_tel[0].cur.load());
+    tilt = wrapd(g_tel[1].cur.load());
+    return true;
+}
+
+static std::string watch_line() {
+    std::lock_guard<std::mutex> lk(g_watch_mtx);
+    char b[200];
+    if (!g_goal_ok) snprintf(b, sizeof(b), "watch  %s (no fixed target)\n", W_NAME[g_wstate]);
+    else snprintf(b, sizeof(b), "watch  %s  target (%.3f, %.3f) rad  error pan %.1f tilt %.1f deg%s\n", W_NAME[g_wstate],
+                  g_goal[0], g_goal[1], g_werr[0], g_werr[1],
+                  g_wcfg.correct ? (std::string("  corrections ") + std::to_string(g_corr_count)).c_str() : "");
+    return b;
+}
+
 // ===== 축별 offset 기억 (콜드부팅 때 처진 자세 각도 계산용) =====
 static bool  g_stored_off_ok[2] = { false, false };
 static float g_stored_off[2]    = { 0, 0 };
@@ -700,6 +1042,9 @@ static double uptime_s() {
 static bool decide_axis(AxisInfo& a) {
     query_version(a);
     query_state(a);
+    a.has_q = fw_has_q(a.version);
+    query_q(a);                       // Q 는 조회만. I 처럼 offset 을 채우는지는 모름 -> T 뒤, I 앞
+    if (a.q_ok && (a.q_flags & Q_RUN_BIT) && a.state_ok) g_qbit[&a - g_ax].store(1);
     a.state_before = state_str(a);
     PTZ_LOG("PTZ: %s firmware=%s state=%s\n", a.name,
             a.version.empty() ? "(no reply)" : a.version.c_str(), a.state_before.c_str());
@@ -790,6 +1135,7 @@ static void arm_thread_func(bool cold, bool need0, bool need1) {
             a.action += ", state not readable after S";
             PTZ_LOG("PTZ: %s state not readable after S - assume target %.3f\n", a.name, a.start_target);
         }
+        if (need[i]) q_confirm_after_arm(i);
     }
     finish_start(true);
 }
@@ -813,6 +1159,7 @@ static void write_live(const bool ok[2], const float t[2], const float c[2], con
                      (st[i] >= 0 && st[i] <= 3) ? LIVE_STATE_STR[st[i]] : "?");
             f << b;
         }
+        f << watch_line();
     }
     chmod(tmp.c_str(), 0644);
     rename(tmp.c_str(), LIVE_PATH);
@@ -829,7 +1176,10 @@ static void monitor_after_arm() {
             uint64_t next = t0 + (uint64_t)((sec - 1) * 4 + q + 1) * 250000ULL;
             if (now_us() < next) usleep((useconds_t)(next - now_us()));
         }
-        { int st[2] = { 0, 0 }; write_live(ok, t, c, o, st, false); }
+        bool off[2] = { false, false };
+        for (int i = 0; i < 2; ++i) { off[i] = ok[i] && axis_motor_off(i, o[i]); g_motor_off[i].store(off[i]); }
+        watch_eval(ok, c, off);
+        { int st[2] = { off[0] ? 1 : 0, off[1] ? 1 : 0 }; write_live(ok, t, c, o, st, false); }
         PTZ_LOG("PTZ-MON: +%02ds pan %s tilt %s\n", sec,
                 ok[0] ? (std::to_string(t[0]).substr(0, 5) + "/" + std::to_string(wrapd(c[0])).substr(0, 5) + " off " + std::to_string(o[0]).substr(0, 4)).c_str() : "?",
                 ok[1] ? (std::to_string(t[1]).substr(0, 5) + "/" + std::to_string(wrapd(c[1])).substr(0, 5) + " off " + std::to_string(o[1]).substr(0, 4)).c_str() : "?");
@@ -848,24 +1198,29 @@ static void health_thread_func() {
         bool ok[2] = { false, false };
         float ta[2] = { 0, 0 }, ca[2] = { 0, 0 }, oa[2] = { 0, 0 };
         int sta[2] = { 0, 0 };
+        bool offa[2] = { false, false };
         for (int i = 0; i < 2; ++i) {
             if (g_ax[i].fd < 0) continue;
             ok[i] = tel_query(i, ta[i], ca[i], oa[i]);
             float t = ta[i], c = ca[i], o = oa[i];
             int st = 0;
+            offa[i] = ok[i] && axis_motor_off(i, o);
+            g_motor_off[i].store(offa[i]);
             if (!ok[i]) st = 3;
-            else if (fabsf(o) <= OFFSET_ZERO_EPS) st = 1;
+            else if (offa[i]) st = 1;
             else if (!moving && fabsf(wrapd(c - t)) > NOT_HOLDING_RAD) st = 2;
             sta[i] = st;
             if (moving) continue;   // 이동 중엔 판정을 바꾸지 않는다
             if (st != last_state[i]) {
                 if (st == 0) PTZ_LOG("PTZ: %s back to normal (target %.2f, current %.2f)\n", g_ax[i].name, t, c);
-                else if (st == 1) PTZ_LOG("PTZ-ALERT: %s motor is OFF (offset 0) - not retrying\n", g_ax[i].name);
+                else if (st == 1) PTZ_LOG("PTZ-ALERT: %s motor is OFF (%s) - not retrying\n", g_ax[i].name,
+                                          g_ax[i].has_q ? "Q running bit 0" : "offset 0");
                 else if (st == 2) PTZ_LOG("PTZ-ALERT: %s not holding target (target %.2f, current %.2f)\n", g_ax[i].name, t, c);
                 else PTZ_LOG("PTZ-ALERT: %s no reply to state query\n", g_ax[i].name);
                 last_state[i] = st;
             }
         }
+        watch_eval(ok, ca, offa);
         write_live(ok, ta, ca, oa, sta, moving);
     }
 }
@@ -889,6 +1244,8 @@ static void finish_start(bool from_arm) {
         for (int i = 0; i < 2; ++i) { off[i] = g_ax[i].off; ok[i] = g_ax[i].state_ok && g_ax[i].off_known; }
         save_offsets_if_changed(off, ok);
     }
+    g_ramp_end_us.store(now_us());
+    watch_set_goal(sp, st);          // 시작 위치를 목표로 감시 시작 (명령은 보내지 않음)
     g_motion_enabled.store(true);
     save_position_to_file();
     write_mcu_info();
@@ -904,11 +1261,15 @@ static void finish_start(bool from_arm) {
     std::thread(health_thread_func).detach();
 }
 
+static void zoom_start();
+static void load_home_from_file();
+
 void ptz_init(void) {
     float fz = 0;
     g_have_file = load_position_from_file(g_file_pan, g_file_tilt, fz);
     set_current_zoom(g_have_file ? fz : 0.0f);
     load_offsets();
+    watch_load_cfg();
 
     bool cold = is_first_start_after_cold_boot();
     PTZ_LOG("PTZ: boot %s\n", g_boot_desc.c_str());
@@ -952,6 +1313,8 @@ void ptz_init(void) {
     std::thread(serial_reader_thread_func).detach();
     std::thread(continuous_move_thread_func).detach();
     mqtt_init();
+    load_home_from_file();
+    zoom_start();   // 줌카메라 실제 줌을 0.5초마다 읽기 시작 (모터 기동과 무관)
 
     if (need[0] || need[1]) {
         write_mcu_info();
@@ -1057,7 +1420,10 @@ static std::string render_daemon(bool full) {
 
 // 데몬이 없을 때: 직접 조회 (V/T만 - 'I'는 미기동 MCU의 offset을 채워 다음 기동 판정을 흐리므로 안 보냄)
 static std::string render_direct(bool first) {
-    for (int i = 0; i < 2; ++i) if (g_ax[i].fd >= 0) { if (first) query_version(g_ax[i]); query_state(g_ax[i]); }
+    for (int i = 0; i < 2; ++i) if (g_ax[i].fd >= 0) {
+        if (first) { query_version(g_ax[i]); g_ax[i].has_q = fw_has_q(g_ax[i].version); }
+        query_state(g_ax[i]); query_q(g_ax[i]);
+    }
     std::string out = c(LIVE_HDR, " DIRECT QUERY  (onvif_srvd not running) ") + "\n";
     const char* axis_col = nullptr;
     std::istringstream in(mcu_report(false));
@@ -1110,29 +1476,200 @@ int ptz_mcu_info_cli(const char* mode, int watch_ms) {
 const char* ptz_build_info(void) { return MK3_BUILD_INFO; }
 
 // ===== Zoom (ONVIF SOAP, libcurl) =====
-// 줌 카메라 응답 본문은 버린다 (기본 동작은 stdout 출력 -> 로그에 XML 이 쌓였음)
-static size_t zoom_discard_body(char*, size_t size, size_t nmemb, void*) { return size * nmemb; }
+// 줌카메라 접속 정보 (zoom_start 에서 한 번 정한다)
+static std::string g_zoom_user, g_zoom_pass, g_zoom_url, g_zoom_src;
 
-static void zoom_soap_call(const char* xml_body) {
-    CURL* curl = curl_easy_init();
-    if (!curl) { PTZ_LOG("PTZ[ZOOM]: curl_easy_init failed\n"); return; }
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/soap+xml; charset=utf-8");
-    curl_easy_setopt(curl, CURLOPT_URL,        ZOOM_CAM_URL);
+static std::string url_decode(const std::string& s) {
+    std::string o;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) && isxdigit((unsigned char)s[i + 2])) {
+            o += (char)strtol(s.substr(i + 1, 2).c_str(), nullptr, 16);
+            i += 2;
+        } else o += s[i];
+    }
+    return o;
+}
+
+// mediamtx.yml 의 detection_zoom: 아래 source: rtsp://user:pass@host[:port]/path
+static bool zoom_from_mediamtx(const char* path, std::string& user, std::string& pass, std::string& host) {
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+    std::string l;
+    bool in = false;
+    while (std::getline(f, l)) {
+        if (l.find("detection_zoom:") != std::string::npos) { in = true; continue; }
+        if (!in) continue;
+        size_t p = l.find("source:");
+        if (p == std::string::npos) {
+            // 다음 경로 블록으로 넘어가면 중단 (들여쓰기 2칸 이하의 키)
+            size_t nb = l.find_first_not_of(' ');
+            if (nb != std::string::npos && nb <= 2 && l[nb] != '#') return false;
+            continue;
+        }
+        size_t r = l.find("rtsp://", p);
+        if (r == std::string::npos) return false;
+        std::string u = l.substr(r + 7);
+        size_t sp = u.find_first_of(" \t\r\"'");
+        if (sp != std::string::npos) u.erase(sp);
+        size_t at = u.rfind('@', u.find('/'));          // 비밀번호에 '@'가 인코딩 안 됐을 수도 있어 경로 앞의 마지막 '@'
+        if (at == std::string::npos) return false;
+        std::string cred = u.substr(0, at), hp = u.substr(at + 1);
+        size_t colon = cred.find(':');
+        if (colon == std::string::npos) return false;
+        user = url_decode(cred.substr(0, colon));
+        pass = url_decode(cred.substr(colon + 1));
+        host = hp.substr(0, hp.find_first_of(":/"));   // RTSP 포트는 버리고 호스트만 (ONVIF 는 HTTP 80)
+        if (user.empty() || host.empty() || cred.find("__ZOOM_") != std::string::npos) return false;
+        return true;
+    }
+    return false;
+}
+
+static bool g_zoom_enabled = false;   // 계정을 찾았을 때만 true
+
+static void zoom_config_init() {
+    std::string user, pass, host = ZOOM_CAM_HOST_DEFAULT;
+    const char* eu = getenv("ZOOM_CAM_USER");
+    const char* ep = getenv("ZOOM_CAM_PASS");
+    bool ok = false;
+    // mediamtx.yml 에서 호스트는 항상 가져오고(있으면), 계정은 env 가 우선
+    for (const char* path : MEDIAMTX_YML_PATHS) {
+        std::string u, p, h;
+        if (zoom_from_mediamtx(path, u, p, h)) { user = u; pass = p; host = h; g_zoom_src = path; ok = true; break; }
+    }
+    if (eu && *eu && ep && *ep) { user = eu; pass = ep; g_zoom_src = "env ZOOM_CAM_USER/ZOOM_CAM_PASS"; ok = true; }
+    if (!ok) {
+        PTZ_LOG("PTZ-ALERT: zoom camera account not found (env ZOOM_CAM_USER/ZOOM_CAM_PASS or mediamtx.yml detection_zoom)"
+                " - zoom control disabled\n");
+        return;
+    }
+    g_zoom_user = user; g_zoom_pass = pass;
+    g_zoom_enabled = true;
+    g_zoom_url = "http://" + host + "/onvif/ptz_service";
+    PTZ_LOG("PTZ: zoom camera %s@%s (account from %s)\n", user.c_str(), host.c_str(), g_zoom_src.c_str());
+}
+
+static size_t zoom_collect_body(char* p, size_t size, size_t nmemb, void* ud) {
+    std::string* s = (std::string*)ud;
+    if (s && s->size() < 65536) s->append(p, size * nmemb);
+    return size * nmemb;
+}
+
+// SOAP 한 번. body 가 nullptr 이 아니면 응답 본문을 받는다 (nullptr 이면 버림 - 예전엔 stdout 으로 나가 로그에 XML 이 쌓였음)
+// h 가 nullptr 이면 새 핸들 (지금은 항상 nullptr - zoom_poll_thread_func 주석 참고)
+static bool zoom_soap_post(CURL* h, const char* xml_body, long timeout_ms, std::string* body, std::string* err) {
+    if (!g_zoom_enabled) { if (err) *err = "zoom camera account not configured"; return false; }
+    CURL* curl = h ? h : curl_easy_init();
+    if (!curl) { if (err) *err = "curl_easy_init failed"; return false; }
+    std::string sink;
+    struct curl_slist* headers = curl_slist_append(nullptr, "Content-Type: application/soap+xml; charset=utf-8");
+    curl_easy_setopt(curl, CURLOPT_URL,        g_zoom_url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPAUTH,   CURLAUTH_ANY);
-    curl_easy_setopt(curl, CURLOPT_USERPWD,    ZOOM_CAM_USERPWD);
+    curl_easy_setopt(curl, CURLOPT_USERNAME,   g_zoom_user.c_str());
+    curl_easy_setopt(curl, CURLOPT_PASSWORD,   g_zoom_pass.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, xml_body);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,    3L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, std::min(timeout_ms, 1000L));
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,   1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, zoom_discard_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, zoom_collect_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,  body ? body : &sink);
     CURLcode res = curl_easy_perform(curl);
     long http = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
-    if (res != CURLE_OK) PTZ_LOG("PTZ[ZOOM]: curl error: %s\n", curl_easy_strerror(res));
-    else if (http != 200) PTZ_LOG("PTZ[ZOOM]: zoom camera replied HTTP %ld\n", http);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, (struct curl_slist*)nullptr);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    if (!h) curl_easy_cleanup(curl);
+    bool ok = (res == CURLE_OK && http == 200);
+    if (!ok && err) *err = (res != CURLE_OK) ? curl_easy_strerror(res) : ("HTTP " + std::to_string(http));
+    return ok;
+}
+
+static void zoom_soap_call(const char* xml_body) {
+    if (!g_zoom_enabled) return;   // 시작 때 PTZ-ALERT 로 이미 알림
+    std::string err;
+    if (!zoom_soap_post(nullptr, xml_body, ZOOM_CMD_TIMEOUT_MS, nullptr, &err))
+        PTZ_LOG("PTZ[ZOOM]: zoom camera command failed: %s\n", err.c_str());
+}
+
+// GetStatus 응답에서 PTZStatus/Position/Zoom 의 x 만 읽는다 (MoveStatus/Zoom 은 IDLE 같은 글자라 무시)
+static bool parse_zoom_position(const std::string& xml, float& z) {
+    size_t ps = xml.find(":Position>");
+    if (ps == std::string::npos) ps = xml.find("<Position>");
+    if (ps == std::string::npos) return false;
+    size_t pe = xml.find("Position>", ps + 10);
+    if (pe == std::string::npos) return false;
+    size_t zs = xml.find("Zoom", ps);
+    if (zs == std::string::npos || zs > pe) return false;
+    size_t tag_end = xml.find('>', zs);
+    size_t xs = xml.find(" x=\"", zs);
+    if (xs == std::string::npos || xs > tag_end) return false;
+    char* endp = nullptr;
+    float v = strtof(xml.c_str() + xs + 4, &endp);
+    if (endp == xml.c_str() + xs + 4 || !std::isfinite(v) || v < -0.05f || v > 1.05f) return false;
+    z = clampf(v, ZOOM_MIN, ZOOM_MAX);
+    return true;
+}
+
+static bool zoom_read_status(CURL* h, long timeout_ms, float& z, std::string& err) {
+    char body[640];
+    snprintf(body, sizeof(body),
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\""
+                    " xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\">"
+          "<s:Body><tptz:GetStatus><tptz:ProfileToken>%s</tptz:ProfileToken></tptz:GetStatus></s:Body>"
+        "</s:Envelope>", ZOOM_CAM_TOKEN);
+    std::string resp;
+    if (!zoom_soap_post(h, body, timeout_ms, &resp, &err)) return false;
+    if (!parse_zoom_position(resp, z)) { err = "no Position/Zoom in GetStatus reply"; return false; }
+    return true;
+}
+
+static std::atomic<bool> g_zoom_read_ok{false};   // 마지막 백그라운드 조회 성공 여부
+
+// 0.5초마다 줌카메라의 실제 줌을 읽어 g_cur_zoom 을 갱신. 실패/회복은 바뀔 때만 로그.
+// curl 핸들은 매번 새로 만든다: 이 줌카메라(UV-ZNH4110M)는 Digest 를 아는 curl 이 보내는 빈 본문 탐색 POST 에
+// 인증 요구 없이 200 을 돌려줘서, 그 뒤 본 요청이 인증 없이 나가 401 이 된다 (2026-11-04 curl --digest 로 확인).
+// 새 핸들 + CURLAUTH_ANY 는 본 요청 -> 401 -> Digest 재전송 순서라 정상 (기존 줌 명령과 같은 방식).
+static void zoom_poll_thread_func() {
+    int state = -1;   // -1 처음, 0 실패, 1 정상
+    std::string last_err;
+    while (true) {
+        float z = 0;
+        std::string err;
+        bool ok = zoom_read_status(nullptr, ZOOM_POLL_TIMEOUT_MS, z, err);
+        if (ok) {
+            set_current_zoom(z);
+            g_zoom_read_ok.store(true);
+            if (state != 1) PTZ_LOG("PTZ: zoom camera status %s - zoom %.3f\n", state == 0 ? "OK again" : "OK", z);
+            state = 1;
+        } else {
+            g_zoom_read_ok.store(false);
+            if (state != 0 || err != last_err)
+                PTZ_LOG("PTZ-ALERT: zoom camera status read failed (%s) - using last known zoom %.3f\n",
+                        err.c_str(), get_current_zoom());
+            state = 0; last_err = err;
+        }
+        usleep(ZOOM_POLL_MS * 1000);
+    }
+}
+
+// SetPreset/SetHome/RelativeMove 용: 그 자리에서 한 번 더 읽는다.
+// 줌카메라가 응답하지 않는 중이면(백그라운드 조회 실패) 기다리지 않고 마지막 값.
+static float zoom_current_fresh() {
+    if (g_zoom_read_ok.load()) {
+        float z = 0;
+        std::string err;
+        if (zoom_read_status(nullptr, ZOOM_FRESH_TIMEOUT_MS, z, err)) { set_current_zoom(z); return z; }
+        PTZ_LOG("PTZ[ZOOM]: fresh zoom read failed (%s) - using last known %.3f\n", err.c_str(), get_current_zoom());
+    }
+    return get_current_zoom();
+}
+
+static void zoom_start() {
+    curl_global_init(CURL_GLOBAL_DEFAULT);   // 스레드에서 curl 을 쓰기 전에 한 번 (thread-safe 하지 않음)
+    zoom_config_init();
+    if (g_zoom_enabled) std::thread(zoom_poll_thread_func).detach();
 }
 
 static void zoom_soap_absolute(float level) {
@@ -1355,7 +1892,7 @@ int PTZBindingService::SetPreset(
     }
     PresetRec cur;
     get_current_pt(cur.pan, cur.tilt);
-    cur.zoom = get_current_zoom();
+    cur.zoom = zoom_current_fresh();   // 웹/NVR 이 줌카메라를 직접 움직였을 수 있으므로 실제 값
     if (tptz__SetPreset->PresetName && !tptz__SetPreset->PresetName->empty())
         cur.name = *tptz__SetPreset->PresetName;
     { std::lock_guard<std::mutex> lock(g_preset_mtx); g_presets[token] = cur; }
@@ -1406,6 +1943,21 @@ int PTZBindingService::GotoPreset(
 static std::mutex g_home_mtx;
 static float g_home_pan = 0.0f, g_home_tilt = 0.0f, g_home_zoom = 0.0f;
 
+static void load_home_from_file() {
+    std::ifstream f(HOME_DB_PATH);
+    float p, t, z;
+    if (!(f >> p >> t >> z)) return;
+    std::lock_guard<std::mutex> lk(g_home_mtx);
+    g_home_pan = p; g_home_tilt = t; g_home_zoom = z;
+    PTZ_LOG("PTZ: home position (%.3f, %.3f, zoom %.3f) from %s\n", p, t, z, HOME_DB_PATH);
+}
+
+static void save_home_to_file(float p, float t, float z) {
+    ensure_dir(PRESET_DB_DIR);
+    std::ofstream f(HOME_DB_PATH, std::ios::trunc);
+    if (f.is_open()) f << p << " " << t << " " << z << "\n";
+}
+
 int PTZBindingService::GotoHomePosition(
     _tptz__GotoHomePosition* req,
     _tptz__GotoHomePositionResponse& res)
@@ -1430,8 +1982,10 @@ int PTZBindingService::SetHomePosition(
     UNUSED(tptz__SetHomePositionResponse);
     float pan, tilt;
     get_current_pt(pan, tilt);
-    float zoom = get_current_zoom();
+    float zoom = zoom_current_fresh();
     { std::lock_guard<std::mutex> lk(g_home_mtx); g_home_pan = pan; g_home_tilt = tilt; g_home_zoom = zoom; }
+    save_home_to_file(pan, tilt, zoom);   // 재시작 뒤에도 유지
+    PTZ_LOG("PTZ: home position set (%.3f, %.3f, zoom %.3f)\n", pan, tilt, zoom);
     return SOAP_OK;
 }
 
@@ -1500,6 +2054,7 @@ int PTZBindingService::RelativeMove(
     if (req->Translation && req->Translation->Zoom) {
         const float dzoom = req->Translation->Zoom->x * REL_SCALE_ZOOM;
         if (dzoom != 0.0f) {
+            zoom_current_fresh();          // 실제 줌을 기준으로 더한다 (안 그러면 줌이 튐)
             adjust_current_zoom(dzoom);
             goto_current_zoom();
         }
@@ -1530,7 +2085,10 @@ int PTZBindingService::GetStatus(
 {
     UNUSED(tptz__GetStatus);
     float pan, tilt;
-    get_current_pt(pan, tilt);
+    get_current_pt(pan, tilt);       // 명령 위치 (실측을 못 쓸 때)
+    bool moving = false;
+    std::string err;
+    watch_status(pan, tilt, moving, err);   // 실측이 있으면 pan/tilt 를 실측으로 바꾼다
     float zoom = get_current_zoom();
     float tsign = is_hang_mode() ? -1.0f : 1.0f;
 
@@ -1539,7 +2097,9 @@ int PTZBindingService::GetStatus(
     tptz__GetStatusResponse.PTZStatus->Position->PanTilt = soap_new_req_tt__Vector2D(soap, pan, tilt * tsign);
     tptz__GetStatusResponse.PTZStatus->Position->Zoom    = soap_new_req_tt__Vector1D(soap, zoom);
     tptz__GetStatusResponse.PTZStatus->MoveStatus = soap_new_tt__PTZMoveStatus(soap);
-    tptz__GetStatusResponse.PTZStatus->MoveStatus->PanTilt = soap_new_ptr(soap, tt__MoveStatus::IDLE);
+    tptz__GetStatusResponse.PTZStatus->MoveStatus->PanTilt =
+        soap_new_ptr(soap, moving ? tt__MoveStatus::MOVING : tt__MoveStatus::IDLE);
+    if (!err.empty()) tptz__GetStatusResponse.PTZStatus->Error = soap_new_std_string(soap, err);
     tptz__GetStatusResponse.PTZStatus->MoveStatus->Zoom    = soap_new_ptr(soap, tt__MoveStatus::IDLE);
     tptz__GetStatusResponse.PTZStatus->UtcTime = time(nullptr);
     return SOAP_OK;

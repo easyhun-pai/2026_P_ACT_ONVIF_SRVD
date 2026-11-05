@@ -1,0 +1,2 @@
+# 장비(Linux)로 가는 파일이라 Windows에서도 LF 유지 (CRLF면 #!/bin/bash, git apply 실패)
+* text=auto eol=lf

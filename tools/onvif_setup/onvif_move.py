@@ -7,7 +7,7 @@
   python3 onvif_move.py 30 70 --speed 0.5   # 속도 0.1~1.0 (1.0 = 팬 3.0 rad/s). 없으면 ONVIF 기본 속도
   python3 onvif_move.py --preset 1          # 프리셋 1 로
   python3 onvif_move.py --list              # 프리셋 목록
-  python3 onvif_move.py                     # 지금 각도만 표시
+  python3 onvif_move.py                     # 지금 각도만 표시 (+ ONVIF GetStatus: 실측, MoveStatus, Error)
   기본은 도착할 때까지 기다리며 각도를 보여 준다. --no-wait 로 보내기만.
 """
 import argparse
@@ -50,6 +50,29 @@ def read_live():
         if m:
             d[m.group(1)] = (float(m.group(2)), float(m.group(3)), m.group(4).strip())
     return d if "pan" in d and "tilt" in d else None
+
+
+def onvif_status():
+    """GetStatus: (pan, tilt, MoveStatus, Error). mk3-basic stream 빌드부터 pan/tilt 는 실측, Error 는 감시 결과."""
+    try:
+        r = soap(f'<tptz:GetStatus><tptz:ProfileToken>{PROFILE}</tptz:ProfileToken></tptz:GetStatus>')
+    except Exception as e:
+        return None, str(e)
+    pt = re.search(r'Position>.*?PanTilt[^>]*x="([-\d.eE]+)"[^>]*y="([-\d.eE]+)"', r, re.S)
+    mv = re.search(r'MoveStatus>.*?PanTilt>(\w+)<', r, re.S)
+    er = re.search(r'Error>([^<]*)<', r)
+    if not pt:
+        return None, "no Position in GetStatus"
+    return (float(pt[1]), float(pt[2]), mv[1] if mv else "?", er[1] if er else ""), ""
+
+
+def show_onvif(prefix=""):
+    st, err = onvif_status()
+    if not st:
+        print(prefix + f"(GetStatus failed: {err})")
+        return
+    print(f"{prefix}pan {math.degrees(st[0]):+6.1f} deg  tilt {math.degrees(st[1]):5.1f} deg  "
+          f"MoveStatus {st[2]}" + (f"  Error {st[3]}" if st[3] else "  Error -"))
 
 
 def show(prefix=""):
@@ -129,6 +152,7 @@ def main():
         print(f"AbsoluteMove -> pan {math.degrees(pan):+.1f} deg tilt {math.degrees(tilt):.1f} deg" + (f" speed {a.speed}" if a.speed else ""))
     elif a.pan is None:
         show()
+        show_onvif("onvif:  ")
         return 0
     else:
         print("[ERROR] give both PAN and TILT")
@@ -138,6 +162,8 @@ def main():
         return 0
     ok, dt = wait_arrive(*target)
     show("after:  ")
+    time.sleep(0.6)   # onvif 감시 판정(0.5초 주기)이 도착을 반영할 시간
+    show_onvif("onvif:  ")
     print(f"{'arrived' if ok else 'NOT arrived (timeout / limit / motor off?)'} in {dt:.1f} s")
     return 0 if ok else 1
 

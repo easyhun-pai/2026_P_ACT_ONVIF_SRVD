@@ -13,6 +13,8 @@
 - 배포는 한 대씩, 검증 후 다음 대
 - **edge 패키지 업데이트(`install.sh`)는 `/usr/local/bin/onvif_srvd` 와 `/home/ptz/edge/onvif_start.sh` 를 덮어쓴다.**
   정식 반영은 edge 패키지에 넣어야 한다.
+  install.sh 는 `<edge 배포 서버>/<버전>/onvif-deps.tar.gz` 를 `/` 에 풀며, 이 묶음의 onvif_srvd 가 현장 원본(448443)이다
+  (2026-11-03 rc18 설치 때 ptz018 의 mk3-basic 이 원본으로 되돌아감). onvif-deps 의 `usr/local/bin/onvif_srvd` 를 교체해야 한다.
 
 ## 배포 묶음 (권장)
 

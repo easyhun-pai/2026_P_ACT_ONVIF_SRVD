@@ -28,6 +28,19 @@ onvif_setup — ONVIF(mk3-basic) 장비 시험 도구
    python3 onvif_move.py                        # 지금 각도만
    기본은 도착할 때까지 기다리고 결과 표시 (--no-wait 로 보내기만)
 
+4) 줌 위치 시험 (ONVIF 켠 채로, 장비에서) — 줌이 잠깐 움직임
+   sudo python3 onvif_zoom_test.py              # 웹 경로 줌 → ONVIF GetStatus/SetPreset/GotoPreset/RelativeMove/SetHome 확인
+   시험 프리셋 ztest 는 끝에 지우고 줌은 시작 값으로 되돌림. 마지막 줄 VERDICT: PASS
+
+5) 이동 감시(스트리밍 모드) 시험 — 이동 중/후 GetStatus 실측·MOVING/IDLE·Error 표시
+   python3 onvif_stream_test.py move 0.5 1.2      # AbsoluteMove 후 12초 관찰 (라디안)
+   python3 onvif_stream_test.py watch 10          # 움직이지 않고 관찰
+
+6) 계정 헤더(WS-Security) 받기 시험 — 조회만, 모터 안 움직임
+   python3 onvif_wsse_test.py                     # 헤더 없음·계정 헤더 여러 형태 → 200, 모르는 필수 헤더 → 500
+   python3 onvif_wsse_test.py <장비IP>:1000       # PC 에서도 가능
+   마지막 줄 == ALL PASS
+
 모터 상태만 볼 때:  onvif_srvd --mcu-watch   (Ctrl+C 종료)
 
 시험 결과 CSV(logs/)는 7일 지나면 다음 시험 때 자동 삭제.
