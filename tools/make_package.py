@@ -31,6 +31,7 @@ FILES = {
     "device/onvif_setup/onvif_stream_test.py": "tools/onvif_setup/onvif_stream_test.py",
     "device/onvif_setup/onvif_wsse_test.py": "tools/onvif_setup/onvif_wsse_test.py",
     "device/onvif_setup/onvif_auth_test.py": "tools/onvif_setup/onvif_auth_test.py",
+    "device/onvif_setup/onvif_preset_name_test.py": "tools/onvif_setup/onvif_preset_name_test.py",
     "device/edge_onvif_auth_patch.py": "deploy/edge_onvif_auth_patch.py",
     "docs/VERSIONS.md": "docs/VERSIONS.md",
     "docs/PTZ_STREAMING.md": "docs/PTZ_STREAMING.md",
@@ -51,7 +52,8 @@ EXEC = {"device/onvif_srvd", "device/onvif_start.sh",
         "device/onvif_setup/onvif_cam_view.py", "device/onvif_setup/onvif_pan_tilt.py",
         "device/onvif_setup/onvif_move.py", "device/onvif_setup/onvif_zoom_test.py",
         "device/onvif_setup/onvif_stream_test.py", "device/onvif_setup/onvif_wsse_test.py",
-        "device/onvif_setup/onvif_auth_test.py", "device/edge_onvif_auth_patch.py"}
+        "device/onvif_setup/onvif_auth_test.py", "device/onvif_setup/onvif_preset_name_test.py",
+        "device/edge_onvif_auth_patch.py"}
 
 INSTALL_TXT = """ONVIF mk3-basic 장비 설치 (장비에서 실행, 인터넷 불필요)
 

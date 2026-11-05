@@ -884,6 +884,9 @@ void init_gsoap(void)
     if(!soap)
         daemon_error_exit("Can't get mem for SOAP\n");
 
+    // MK3: 문자열을 UTF-8 그대로 주고받는다 (2026-11-05). 기본 모드는 글자마다 아래 1바이트만 남겨
+    //      한글 프리셋 이름이 깨졌다 ("정문 입구" -> "\x15 8 \x85 l")
+    soap_set_mode(soap, SOAP_C_UTFSTRING);
     soap->fignore = mk3_fignore;   // MK3: WS-Security 헤더 허용
     g_orig_frecv  = soap->frecv;   // MK3: 계정 확인용으로 받은 원문 앞부분 보관
     soap->frecv   = mk3_frecv;

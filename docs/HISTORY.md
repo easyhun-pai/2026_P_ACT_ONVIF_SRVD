@@ -162,8 +162,16 @@ dispatcher 를 `try-restart` + IP 비교로 수정 ([INCIDENT-261027](incidents/
 - ptz018 시험 통과: 예외 상황 포함 114건, ODM 실기 확인 — [WSSE.md](WSSE.md). **v1.0 = 빌드 `e4d4621a`** (같은 코드를 v1.1 이름으로 빌드한 `171ba6d8` 은 v1.0 으로 합침)
   - 시험 중 버그 1건 수정: 원문 파일이 없어 Digest 를 확인 못 한 것까지 실패로 세서 ODM 이 스스로 잠김
 
+### 11-05 · 프리셋 이름 띄어쓰기·한글 → v1.0 (`8a8bc609`)
+- 점검 중 발견. `presets.txt` 를 이름 한 단어만 읽어서, "Front door" 처럼 띄어쓰기가 있으면 뒤 프리셋들이 한 칸씩 밀려
+  엉뚱한 위치로 가거나 사라짐 → 다음 프리셋 저장·삭제 때 그대로 덮어씀 (원본부터 있던 문제)
+- 한글 이름이 깨짐 ("정문 입구" → 깨진 바이트) — gSOAP 기본 모드가 글자마다 아래 1바이트만 남김 → `SOAP_C_UTFSTRING`
+- 이름은 줄 끝까지 읽음 (edge `ptz_api.py` 와 같은 방식, 파일 형식 그대로), 깨진 줄은 그 줄만 버림, 저장은 임시 파일 → 바꿔 넣기,
+  token 띄어쓰기는 `_`, 이름 줄바꿈·탭은 공백
+- ptz018 시험: `onvif_preset_name_test.py` 25건 + 계정 시험(43·17·장비 안) 다시 PASS. **v1.0 = 빌드 `8a8bc609`**
+
 ### 남은 일
-- [ ] edge onvif-deps.tar.gz 에 v1.0(`e4d4621a`) + edge 패치(`deploy/edge_onvif_auth_patch.py`) 반영
+- [ ] edge onvif-deps.tar.gz 에 v1.0(`8a8bc609`) + edge 패치(`deploy/edge_onvif_auth_patch.py`) 반영
 - [ ] 모터 펌웨어 v2.5.1 실장비에서 Q 켜짐 비트 확인 (라이다는 Debian 13 에서 빌드)
 - [ ] 줌카메라 비밀번호 교체 검토 (예전 소스 이력·07-28 공개 패키지에 남아 있음)
 - [ ] 콜드부팅 후 처진 자세 유지가 맞는지, 30초 대기가 적절한지 확인 (확인 필요)

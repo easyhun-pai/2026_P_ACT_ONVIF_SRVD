@@ -46,6 +46,10 @@ onvif_setup — ONVIF(mk3-basic) 장비 시험 도구
    python3 onvif_auth_test.py <장비IP> --password <웹 비밀번호> --expect-digest-fail   # 원문 파일 없는 장비
    마지막 줄 == ALL PASS. ODM 이 틀린 비밀번호로 켜져 있으면 그 PC 가 잠겨 결과가 틀어지니 ODM 을 닫고 할 것
 
+8) 프리셋 이름 시험 (장비에서) — 모터 안 움직임. presets.txt 를 백업하고 끝나면 되돌림, 시험 중 onvif_srvd 한 번 재시작
+   sudo python3 onvif_preset_name_test.py        # 띄어쓰기·한글·특수문자 이름, 깨진 줄, 삭제 뒤 유지, edge ptz_api 읽기
+   마지막 줄 == ALL PASS
+
 모터 상태만 볼 때:  onvif_srvd --mcu-watch   (Ctrl+C 종료)
 
 시험 결과 CSV(logs/)는 7일 지나면 다음 시험 때 자동 삭제.

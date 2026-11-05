@@ -32,6 +32,8 @@
    9. 모터 펌웨어 v2.4+ (라이다 신규 v2.5.1) 기동 판정 (2026-11-04)
       - v2.5.1 은 꺼져 있어도 Sensor offset 을 보고 -> 'Q' 상태의 켜짐 비트로 판정 (구 펌웨어는 기존 offset 판정)
       - 켜짐 비트(0x0001)는 가정. 틀리면 안전 쪽(꺼짐 판정 -> S + 자세 유지), 기동 후 스스로 검증해 로그
+  10. 프리셋 이름 띄어쓰기 (2026-11-05): presets.txt 이름을 줄 끝까지 읽는다 (edge ptz_api.py 와 같음).
+      깨진 줄은 그 줄만 버리고, 저장은 임시 파일에 쓴 뒤 바꿔 넣는다
 
  Pan/Tilt : /dev/ttyAMA0, /dev/ttyAMA2 (115200, 'T<rad>\n')
  Zoom     : 줌카메라(기본 192.168.1.68) ONVIF SOAP 직접 호출
@@ -1728,16 +1730,36 @@ struct PresetRec {
 static std::mutex g_preset_mtx;
 static std::map<std::string, PresetRec> g_presets;
 
+// presets.txt 한 줄: "token pan tilt zoom 이름" — 이름은 줄 끝까지 (띄어쓰기 가능, 2026-11-05)
+// edge ptz_api.py 도 같은 방식(split(maxsplit=4))으로 읽는다. 예전엔 이름을 한 단어만 읽어서
+// "Front door" 같은 이름이 있으면 뒤 프리셋들이 한 칸씩 밀려 엉뚱한 위치/삭제 -> 다음 저장 때 그대로 덮어썼다.
+static std::string preset_trim(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
+    return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+}
+static std::string preset_clean_name(std::string s) {     // 줄바꿈·탭 -> 공백 (한 줄에 들어가게)
+    for (char& c : s) if (c == '\r' || c == '\n' || c == '\t' || c == '\v' || c == '\f') c = ' ';
+    return preset_trim(s);
+}
+static std::string preset_clean_token(std::string s) {    // token 은 첫 칸이라 공백 불가 -> '_'
+    for (char& c : s) if (isspace((unsigned char)c)) c = '_';
+    return s;
+}
+
 static void load_presets_from_file() {
     std::lock_guard<std::mutex> lock(g_preset_mtx);
     g_presets.clear();
     std::ifstream fin(PRESET_DB_PATH);
     if (!fin.is_open()) return;
-    std::string token, name;
-    float pan, tilt, zoom;
-    while (fin >> token >> pan >> tilt >> zoom >> name) {
+    std::string line;
+    while (std::getline(fin, line)) {          // 줄마다 따로 — 깨진 줄은 그 줄만 버린다
+        std::istringstream ss(line);
+        std::string token, name;
+        float pan, tilt, zoom;
+        if (!(ss >> token >> pan >> tilt >> zoom)) continue;
+        std::getline(ss, name);
         PresetRec rec;
-        rec.pan = pan; rec.tilt = tilt; rec.zoom = zoom; rec.name = name;
+        rec.pan = pan; rec.tilt = tilt; rec.zoom = zoom; rec.name = preset_trim(name);
         g_presets[token] = rec;
     }
 }
@@ -1745,13 +1767,18 @@ static void load_presets_from_file() {
 static void save_presets_to_file() {
     std::lock_guard<std::mutex> lock(g_preset_mtx);
     ensure_dir(PRESET_DB_DIR);
-    std::ofstream fout(PRESET_DB_PATH, std::ios::trunc);
-    if (!fout.is_open()) return;
-    for (const auto& kv : g_presets) {
-        const PresetRec& r = kv.second;
-        fout << kv.first << " " << r.pan << " " << r.tilt << " " << r.zoom << " "
-             << (r.name.empty() ? kv.first : r.name) << "\n";
+    std::string tmp = std::string(PRESET_DB_PATH) + ".tmp";   // 다 쓴 뒤 바꿔 넣기 (중간에 꺼져도 원래 파일 유지)
+    {
+        std::ofstream fout(tmp, std::ios::trunc);
+        if (!fout.is_open()) return;
+        for (const auto& kv : g_presets) {
+            const PresetRec& r = kv.second;
+            fout << kv.first << " " << r.pan << " " << r.tilt << " " << r.zoom << " "
+                 << (r.name.empty() ? kv.first : r.name) << "\n";
+        }
+        if (!fout.good()) { fout.close(); unlink(tmp.c_str()); return; }
     }
+    rename(tmp.c_str(), PRESET_DB_PATH);
 }
 
 // ===== PTZ 노드/스페이스 =====
@@ -1883,7 +1910,7 @@ int PTZBindingService::SetPreset(
     load_presets_from_file();
     std::string token;
     if (tptz__SetPreset->PresetToken && !tptz__SetPreset->PresetToken->empty())
-        token = *tptz__SetPreset->PresetToken;
+        token = preset_clean_token(*tptz__SetPreset->PresetToken);
     else {
         std::lock_guard<std::mutex> lock(g_preset_mtx);
         int next_id = 1;
@@ -1894,7 +1921,7 @@ int PTZBindingService::SetPreset(
     get_current_pt(cur.pan, cur.tilt);
     cur.zoom = zoom_current_fresh();   // 웹/NVR 이 줌카메라를 직접 움직였을 수 있으므로 실제 값
     if (tptz__SetPreset->PresetName && !tptz__SetPreset->PresetName->empty())
-        cur.name = *tptz__SetPreset->PresetName;
+        cur.name = preset_clean_name(*tptz__SetPreset->PresetName);
     { std::lock_guard<std::mutex> lock(g_preset_mtx); g_presets[token] = cur; }
     save_presets_to_file();
     tptz__SetPresetResponse.PresetToken = token;

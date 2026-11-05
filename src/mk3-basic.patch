@@ -29,10 +29,10 @@ index 0ea27dd..c43865f 100644
 +# MK3: serial PTZ + libcurl + libmosquitto + libcrypto
 +target_link_libraries(${PROJECT_NAME} pthread curl mosquitto crypto)   # crypto: ONVIF 계정 확인(SHA1/SHA256)
 diff --git a/src/ServicePTZ.cpp b/src/ServicePTZ.cpp
-index caafb08..4a1c972 100644
+index caafb08..4109aad 100644
 --- a/src/ServicePTZ.cpp
 +++ b/src/ServicePTZ.cpp
-@@ -1,9 +1,40 @@
+@@ -1,9 +1,42 @@
  /*
   --------------------------------------------------------------------------
 - ServicePTZ.cpp
@@ -71,13 +71,15 @@ index caafb08..4a1c972 100644
 +   9. 모터 펌웨어 v2.4+ (라이다 신규 v2.5.1) 기동 판정 (2026-11-04)
 +      - v2.5.1 은 꺼져 있어도 Sensor offset 을 보고 -> 'Q' 상태의 켜짐 비트로 판정 (구 펌웨어는 기존 offset 판정)
 +      - 켜짐 비트(0x0001)는 가정. 틀리면 안전 쪽(꺼짐 판정 -> S + 자세 유지), 기동 후 스스로 검증해 로그
++  10. 프리셋 이름 띄어쓰기 (2026-11-05): presets.txt 이름을 줄 끝까지 읽는다 (edge ptz_api.py 와 같음).
++      깨진 줄은 그 줄만 버리고, 저장은 임시 파일에 쓴 뒤 바꿔 넣는다
 +
 + Pan/Tilt : /dev/ttyAMA0, /dev/ttyAMA2 (115200, 'T<rad>\n')
 + Zoom     : 줌카메라(기본 192.168.1.68) ONVIF SOAP 직접 호출
  -----------------------------------------------------------------------------
  */
  
-@@ -11,395 +42,2162 @@
+@@ -11,395 +44,2187 @@
  #include "ServiceContext.h"
  #include "smacros.h"
  #include "stools.h"
@@ -745,14 +747,14 @@ index caafb08..4a1c972 100644
 +        { std::lock_guard<std::mutex> lk(g_pending_mtx); g_pending = true; g_pending_pan = p; g_pending_tilt = t; }
 +        PTZ_LOG("PTZ: move to (%.3f, %.3f) requested before motors are armed - will run after arming\n", p, t);
 +        return;
-+    }
+     }
 +    uint32_t gen = g_goto_gen.fetch_add(1) + 1;
 +    float sp = CONT_STEP_PAN, st = CONT_STEP_TILT;
 +    if (speed > 0.0f) {
 +        float s = clampf(speed, 0.05f, 1.0f);
 +        sp = GOTO_MAX_STEP_PAN * s;
 +        st = GOTO_MAX_STEP_TILT * s;
-     }
++    }
 +    { float gp, gt; get_current_pt(gp, gt); watch_set_goal(gp, gt); }
 +    g_ramp_running.fetch_add(1);   // 스레드가 뜨기 전 틈에 '정지'로 판정되지 않게 (스레드의 RampGuard 와 짝)
 +    std::thread([gen, sp, st]() { goto_ramp_thread_func(gen, sp, st); g_ramp_running.fetch_sub(1); }).detach();
@@ -1932,35 +1934,56 @@ index caafb08..4a1c972 100644
 +static std::mutex g_preset_mtx;
 +static std::map<std::string, PresetRec> g_presets;
 +
++// presets.txt 한 줄: "token pan tilt zoom 이름" — 이름은 줄 끝까지 (띄어쓰기 가능, 2026-11-05)
++// edge ptz_api.py 도 같은 방식(split(maxsplit=4))으로 읽는다. 예전엔 이름을 한 단어만 읽어서
++// "Front door" 같은 이름이 있으면 뒤 프리셋들이 한 칸씩 밀려 엉뚱한 위치/삭제 -> 다음 저장 때 그대로 덮어썼다.
++static std::string preset_trim(const std::string& s) {
++    size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
++    return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
++}
++static std::string preset_clean_name(std::string s) {     // 줄바꿈·탭 -> 공백 (한 줄에 들어가게)
++    for (char& c : s) if (c == '\r' || c == '\n' || c == '\t' || c == '\v' || c == '\f') c = ' ';
++    return preset_trim(s);
++}
++static std::string preset_clean_token(std::string s) {    // token 은 첫 칸이라 공백 불가 -> '_'
++    for (char& c : s) if (isspace((unsigned char)c)) c = '_';
++    return s;
+ }
+ 
 +static void load_presets_from_file() {
 +    std::lock_guard<std::mutex> lock(g_preset_mtx);
 +    g_presets.clear();
 +    std::ifstream fin(PRESET_DB_PATH);
 +    if (!fin.is_open()) return;
-+    std::string token, name;
-+    float pan, tilt, zoom;
-+    while (fin >> token >> pan >> tilt >> zoom >> name) {
++    std::string line;
++    while (std::getline(fin, line)) {          // 줄마다 따로 — 깨진 줄은 그 줄만 버린다
++        std::istringstream ss(line);
++        std::string token, name;
++        float pan, tilt, zoom;
++        if (!(ss >> token >> pan >> tilt >> zoom)) continue;
++        std::getline(ss, name);
 +        PresetRec rec;
-+        rec.pan = pan; rec.tilt = tilt; rec.zoom = zoom; rec.name = name;
++        rec.pan = pan; rec.tilt = tilt; rec.zoom = zoom; rec.name = preset_trim(name);
 +        g_presets[token] = rec;
 +    }
- }
++}
  
 +static void save_presets_to_file() {
 +    std::lock_guard<std::mutex> lock(g_preset_mtx);
 +    ensure_dir(PRESET_DB_DIR);
-+    std::ofstream fout(PRESET_DB_PATH, std::ios::trunc);
-+    if (!fout.is_open()) return;
-+    for (const auto& kv : g_presets) {
-+        const PresetRec& r = kv.second;
-+        fout << kv.first << " " << r.pan << " " << r.tilt << " " << r.zoom << " "
-+             << (r.name.empty() ? kv.first : r.name) << "\n";
++    std::string tmp = std::string(PRESET_DB_PATH) + ".tmp";   // 다 쓴 뒤 바꿔 넣기 (중간에 꺼져도 원래 파일 유지)
++    {
++        std::ofstream fout(tmp, std::ios::trunc);
++        if (!fout.is_open()) return;
++        for (const auto& kv : g_presets) {
++            const PresetRec& r = kv.second;
++            fout << kv.first << " " << r.pan << " " << r.tilt << " " << r.zoom << " "
++                 << (r.name.empty() ? kv.first : r.name) << "\n";
++        }
++        if (!fout.good()) { fout.close(); unlink(tmp.c_str()); return; }
 +    }
++    rename(tmp.c_str(), PRESET_DB_PATH);
 +}
- 
-+// ===== PTZ 노드/스페이스 =====
-+static int GetPTZNode(struct soap* soap, tt__PTZNode* ptzn) {
-+    if (!soap || !ptzn) return SOAP_FAULT;
  
 -int PTZBindingService::ContinuousMove(
 -    _tptz__ContinuousMove         *tptz__ContinuousMove,
@@ -1968,7 +1991,10 @@ index caafb08..4a1c972 100644
 -{
 -    UNUSED(tptz__ContinuousMoveResponse);
 -    DEBUG_MSG("PTZ: %s\n", __FUNCTION__);
--
++// ===== PTZ 노드/스페이스 =====
++static int GetPTZNode(struct soap* soap, tt__PTZNode* ptzn) {
++    if (!soap || !ptzn) return SOAP_FAULT;
+ 
 +    ptzn->token = "PTZNodeToken";
 +    ptzn->Name  = soap_new_std_string(soap, "PTZ");
  
@@ -2118,7 +2144,7 @@ index caafb08..4a1c972 100644
 +    load_presets_from_file();
 +    std::string token;
 +    if (tptz__SetPreset->PresetToken && !tptz__SetPreset->PresetToken->empty())
-+        token = *tptz__SetPreset->PresetToken;
++        token = preset_clean_token(*tptz__SetPreset->PresetToken);
 +    else {
 +        std::lock_guard<std::mutex> lock(g_preset_mtx);
 +        int next_id = 1;
@@ -2129,7 +2155,7 @@ index caafb08..4a1c972 100644
 +    get_current_pt(cur.pan, cur.tilt);
 +    cur.zoom = zoom_current_fresh();   // 웹/NVR 이 줌카메라를 직접 움직였을 수 있으므로 실제 값
 +    if (tptz__SetPreset->PresetName && !tptz__SetPreset->PresetName->empty())
-+        cur.name = *tptz__SetPreset->PresetName;
++        cur.name = preset_clean_name(*tptz__SetPreset->PresetName);
 +    { std::lock_guard<std::mutex> lock(g_preset_mtx); g_presets[token] = cur; }
 +    save_presets_to_file();
 +    tptz__SetPresetResponse.PresetToken = token;
@@ -2474,13 +2500,13 @@ index caafb08..4a1c972 100644
  SOAP_EMPTY_HANDLER(PTZBindingService, tptz, GetPresetTours)
  SOAP_EMPTY_HANDLER(PTZBindingService, tptz, GetPresetTour)
  SOAP_EMPTY_HANDLER(PTZBindingService, tptz, GetPresetTourOptions)
-@@ -407,4 +2205,3 @@ SOAP_EMPTY_HANDLER(PTZBindingService, tptz, CreatePresetTour)
+@@ -407,4 +2232,3 @@ SOAP_EMPTY_HANDLER(PTZBindingService, tptz, CreatePresetTour)
  SOAP_EMPTY_HANDLER(PTZBindingService, tptz, ModifyPresetTour)
  SOAP_EMPTY_HANDLER(PTZBindingService, tptz, OperatePresetTour)
  SOAP_EMPTY_HANDLER(PTZBindingService, tptz, RemovePresetTour)
 -SOAP_EMPTY_HANDLER(PTZBindingService, tptz, GetCompatibleConfigurations)
 diff --git a/src/onvif_srvd.cpp b/src/onvif_srvd.cpp
-index 4eac3f2..72e4f14 100644
+index 4eac3f2..17ed6ae 100644
 --- a/src/onvif_srvd.cpp
 +++ b/src/onvif_srvd.cpp
 @@ -16,6 +16,11 @@
@@ -2942,10 +2968,13 @@ index 4eac3f2..72e4f14 100644
  void init_gsoap(void)
  {
      soap = soap_new();
-@@ -480,6 +884,10 @@ void init_gsoap(void)
+@@ -480,6 +884,13 @@ void init_gsoap(void)
      if(!soap)
          daemon_error_exit("Can't get mem for SOAP\n");
  
++    // MK3: 문자열을 UTF-8 그대로 주고받는다 (2026-11-05). 기본 모드는 글자마다 아래 1바이트만 남겨
++    //      한글 프리셋 이름이 깨졌다 ("정문 입구" -> "\x15 8 \x85 l")
++    soap_set_mode(soap, SOAP_C_UTFSTRING);
 +    soap->fignore = mk3_fignore;   // MK3: WS-Security 헤더 허용
 +    g_orig_frecv  = soap->frecv;   // MK3: 계정 확인용으로 받은 원문 앞부분 보관
 +    soap->frecv   = mk3_frecv;
@@ -2953,7 +2982,7 @@ index 4eac3f2..72e4f14 100644
  
      soap->bind_flags = SO_REUSEADDR;
  
-@@ -505,6 +913,7 @@ void init(void *data)
+@@ -505,6 +916,7 @@ void init(void *data)
      init_signals();
      check_service_ctx();
      init_gsoap();
@@ -2961,7 +2990,7 @@ index 4eac3f2..72e4f14 100644
  }
  
  
-@@ -527,10 +936,14 @@ int main(int argc, char *argv[])
+@@ -527,10 +939,14 @@ int main(int argc, char *argv[])
  
  
          // process service

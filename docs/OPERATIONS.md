@@ -9,7 +9,7 @@
 | `position.txt` | 마지막 위치 `pan tilt zoom` (라디안) | 기록용. 시작 시 위치는 MCU 목표각으로 맞춘다 |
 | `mcu_offset` | 축별 센서 offset (`pan 5.68` / `tilt 3.35`) | 기동 중 읽은 값. 콜드부팅 때 처진 자세 각도 계산에 사용. 지우면 다음 기동 때 다시 기록 |
 | `mount_mode` | `stand` / `hang` | `hang` 이면 tilt 부호 반전. 없으면 `stand` |
-| `presets.txt` | ONVIF 프리셋 | 줌은 저장 순간 줌카메라에서 읽은 실제 값 |
+| `presets.txt` | ONVIF 프리셋 | 한 줄 `token pan tilt zoom 이름` (이름은 줄 끝까지, 띄어쓰기·한글 가능). 줌은 저장 순간 줌카메라에서 읽은 실제 값 |
 | `home.txt` | 홈 위치 `pan tilt zoom` | SetHomePosition 때 기록, 시작 시 읽음 |
 | `ptz_watch.conf` | 이동 감시 설정 (`key = value`, 없으면 기본값) | [PTZ_STREAMING.md](PTZ_STREAMING.md) |
 | `device_id` | 장치 식별자 (MQTT 토픽, ONVIF 계정 확인 기준) | 없으면 밖에서 오는 ONVIF 는 모두 거부 |

@@ -7,7 +7,7 @@ ONVIF Device Manager(ODM)·NVR 은 계정을 `wsse:Security` 헤더(`mustUnderst
 |---|---|---|
 | 원본 ~ stream+q | ONVIF 가 모든 요청 거부 (`MustUnderstand`) | ONVIF 는 되지만 영상(RTSP) 401 |
 | 중간 빌드 `d8d6c013` | ONVIF 받음, **확인은 안 함 → 아무 비밀번호로 PTZ 가능** (영상만 막힘) | 같음 |
-| **v1.0** (`e4d4621a`) | **admin + 웹 비밀번호 확인** — 맞으면 PTZ·영상, 틀리면 둘 다 거부 | 밖에서는 거부 (장비 안은 허용) |
+| **v1.0** (`8a8bc609`) | **admin + 웹 비밀번호 확인** — 맞으면 PTZ·영상, 틀리면 둘 다 거부 | 밖에서는 거부 (장비 안은 허용) |
 
 ## 규칙 (`src/onvif_srvd.cpp` `mk3_authorize`)
 
@@ -47,7 +47,7 @@ ONVIF Device Manager(ODM)·NVR 은 계정을 `wsse:Security` 헤더(`mustUnderst
 
 ## 시험 (ptz018) — 114건 PASS
 
-빌드 `171ba6d8`(같은 코드, 이름 v1.1)에서 전부, 최종 `e4d4621a` 에서 PC 계정 시험·장비 안 시험 다시 PASS. ODM 실기 확인.
+빌드 `171ba6d8`(같은 코드, 이름 v1.1)에서 전부, `e4d4621a`·최종 `8a8bc609` 에서 PC 계정 시험·장비 안 시험 다시 PASS. ODM 실기 확인.
 
 | 시험 | 도구 | 결과 |
 |---|---|---|
