@@ -61,7 +61,8 @@ md5sum onvif_srvd               # 배포 기록용
 
 | md5 | 빌드 | 비고 |
 |---|---|---|
-| **`d8d6c013…`** | **v1.0** — mk3-basic v1.0 2026-11-05 | ptz018 검증. stream+q + ONVIF 계정 헤더(WS-Security) 받기 ([WSSE.md](WSSE.md)). 링크 라이브러리 536e432e 와 같음 |
+| **`171ba6d8…`** | **v1.1** — mk3-basic v1.1 2026-11-05 | ptz018 검증. v1.0 + ONVIF 계정 확인 ([WSSE.md](WSSE.md)). libcrypto 직접 링크 (curl 이 이미 쓰는 라이브러리, 새 의존 없음) |
+| `d8d6c013…` | v1.0 — mk3-basic v1.0 2026-11-05 | ptz018 검증. stream+q + ONVIF 계정 헤더(WS-Security) 받기 ([WSSE.md](WSSE.md)). 링크 라이브러리 536e432e 와 같음 |
 | `536e432e…` | mk3-basic 2026-11-04 stream+q | ptz018 검증. zoomfix + 스트리밍 모드(이동 감시) + v2.4+ 펌웨어 Q 기동 판정 ([PTZ_STREAMING.md](PTZ_STREAMING.md)) |
 | `a6856dac…` | mk3-basic 2026-11-04 zoomfix | ptz018 검증 (03g + 줌 위치 읽기, 홈 저장, 계정 설정 읽기) |
 | `2a450e4c…` | mk3-basic 2026-11-03g | ptz018 검증 (03f 대비 줌 응답 로그 제거) |

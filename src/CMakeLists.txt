@@ -269,5 +269,5 @@ if(WSSE_ON)
 endif()
 
 
-# MK3: serial PTZ + libcurl + libmosquitto
-target_link_libraries(${PROJECT_NAME} pthread curl mosquitto)
+# MK3: serial PTZ + libcurl + libmosquitto + libcrypto
+target_link_libraries(${PROJECT_NAME} pthread curl mosquitto crypto)   # crypto: ONVIF 계정 확인(SHA1/SHA256)

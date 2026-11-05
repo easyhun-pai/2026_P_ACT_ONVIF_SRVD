@@ -16,6 +16,15 @@
   install.sh 는 `<edge 배포 서버>/<버전>/onvif-deps.tar.gz` 를 `/` 에 풀며, 이 묶음의 onvif_srvd 가 현장 원본(448443)이다
   (2026-11-03 rc18 설치 때 ptz018 의 mk3-basic 이 원본으로 되돌아감). onvif-deps 의 `usr/local/bin/onvif_srvd` 를 교체해야 한다.
 
+### v1.1 (ONVIF 계정 확인) 배포 때
+- **밖에서 계정 없이 ONVIF 를 쓰던 클라이언트는 거부된다** (NVR 에 계정 없이 등록한 경우 등). 장비 안(edge 웹·플랫폼 PTZ)은 그대로.
+- **edge 패치 같이**: `sudo python3 edge_onvif_auth_patch.py /home/ptz/edge/settings_handler.py && sudo systemctl restart edge-settings`
+  (묶음 device/ 에 있음, 원본 백업 후). 웹 비밀번호를 바꿀 때 `/var/lib/onvif_srvd/onvif_auth` 에 원문을 쓴다.
+- **이미 웹 비밀번호를 정한 장비**는 원문 파일이 없어 ODM·NVR(Digest)이 거부된다 → 둘 중 하나
+  - 웹에서 비밀번호를 한 번 바꿨다가 되돌리기 (edge 패치 뒤)
+  - 또는 `sudo sh -c "umask 077; printf '%s' '<웹 비밀번호>' > /var/lib/onvif_srvd/onvif_auth"` (틀린 값이면 쓰이지 않음)
+- 문제가 생기면 `sudo touch /var/lib/onvif_srvd/onvif_auth_off` → 바로 v1.0 처럼 확인 안 함
+
 ## 배포 묶음 (권장)
 
 빌드한 장비/PC 에서:

@@ -30,6 +30,9 @@ FILES = {
     "device/onvif_setup/onvif_zoom_test.py": "tools/onvif_setup/onvif_zoom_test.py",
     "device/onvif_setup/onvif_stream_test.py": "tools/onvif_setup/onvif_stream_test.py",
     "device/onvif_setup/onvif_wsse_test.py": "tools/onvif_setup/onvif_wsse_test.py",
+    "device/onvif_setup/onvif_auth_test.py": "tools/onvif_setup/onvif_auth_test.py",
+    "device/edge_onvif_auth_patch.py": "deploy/edge_onvif_auth_patch.py",
+    "docs/VERSIONS.md": "docs/VERSIONS.md",
     "docs/PTZ_STREAMING.md": "docs/PTZ_STREAMING.md",
     "docs/WSSE.md": "docs/WSSE.md",
     "device/onvif_setup/README.txt": "tools/onvif_setup/README.txt",
@@ -47,7 +50,8 @@ FILES = {
 EXEC = {"device/onvif_srvd", "device/onvif_start.sh",
         "device/onvif_setup/onvif_cam_view.py", "device/onvif_setup/onvif_pan_tilt.py",
         "device/onvif_setup/onvif_move.py", "device/onvif_setup/onvif_zoom_test.py",
-        "device/onvif_setup/onvif_stream_test.py", "device/onvif_setup/onvif_wsse_test.py"}
+        "device/onvif_setup/onvif_stream_test.py", "device/onvif_setup/onvif_wsse_test.py",
+        "device/onvif_setup/onvif_auth_test.py", "device/edge_onvif_auth_patch.py"}
 
 INSTALL_TXT = """ONVIF mk3-basic 장비 설치 (장비에서 실행, 인터넷 불필요)
 
@@ -62,12 +66,19 @@ binary md5: {md5}
   B=/home/ptz/onvif_backup_$(date +%Y%m%d); sudo mkdir -p $B
   sudo cp -n /usr/local/bin/onvif_srvd $B/onvif_srvd.prev
   sudo cp -n /home/ptz/edge/onvif_start.sh $B/onvif_start.sh.prev
+  sudo cp -n /home/ptz/edge/settings_handler.py $B/settings_handler.py.prev
 
   # 2) 교체 (이 폴더에서)
   sudo systemctl stop onvif_srvd
   sudo install -m 755 onvif_srvd /usr/local/bin/onvif_srvd
   sudo install -m 755 onvif_start.sh /home/ptz/edge/onvif_start.sh
   sudo systemctl start onvif_srvd
+
+  # 2b) edge 패치 (ONVIF 계정 확인 v1.1 — 웹 비밀번호 변경 때 원문 파일도 씀)
+  sudo python3 edge_onvif_auth_patch.py /home/ptz/edge/settings_handler.py && sudo systemctl restart edge-settings
+  #     이미 웹 비밀번호를 정한 장비: 원문 파일을 한 번 만들어야 ODM·NVR(Digest)이 됨 (틀린 값이면 쓰이지 않음)
+  #     sudo sh -c "umask 077; printf '%s' '<웹 비밀번호>' > /var/lib/onvif_srvd/onvif_auth"
+  #     문제 시 확인 끄기: sudo touch /var/lib/onvif_srvd/onvif_auth_off
 
   # 3) 시험 도구 설치 → ~/workspace/onvif_setup
   mkdir -p /home/ptz/workspace/onvif_setup && cp -r onvif_setup/. /home/ptz/workspace/onvif_setup/
@@ -84,6 +95,7 @@ binary md5: {md5}
   sudo systemctl stop onvif_srvd
   sudo install -m 755 $B/onvif_srvd.prev /usr/local/bin/onvif_srvd
   sudo install -m 755 $B/onvif_start.sh.prev /home/ptz/edge/onvif_start.sh
+  sudo cp $B/settings_handler.py.prev /home/ptz/edge/settings_handler.py && sudo systemctl restart edge-settings
   sudo systemctl start onvif_srvd
 
 주의: edge install.sh 는 바이너리와 onvif_start.sh 를 덮어쓴다.

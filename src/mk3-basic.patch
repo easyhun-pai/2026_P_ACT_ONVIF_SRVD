@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 0ea27dd..236a4cd 100644
+index 0ea27dd..c43865f 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -35,6 +35,17 @@ set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG")
@@ -26,8 +26,8 @@ index 0ea27dd..236a4cd 100644
  endif()
 +
 +
-+# MK3: serial PTZ + libcurl + libmosquitto
-+target_link_libraries(${PROJECT_NAME} pthread curl mosquitto)
++# MK3: serial PTZ + libcurl + libmosquitto + libcrypto
++target_link_libraries(${PROJECT_NAME} pthread curl mosquitto crypto)   # crypto: ONVIF 계정 확인(SHA1/SHA256)
 diff --git a/src/ServicePTZ.cpp b/src/ServicePTZ.cpp
 index caafb08..4a1c972 100644
 --- a/src/ServicePTZ.cpp
@@ -2480,7 +2480,7 @@ index caafb08..4a1c972 100644
  SOAP_EMPTY_HANDLER(PTZBindingService, tptz, RemovePresetTour)
 -SOAP_EMPTY_HANDLER(PTZBindingService, tptz, GetCompatibleConfigurations)
 diff --git a/src/onvif_srvd.cpp b/src/onvif_srvd.cpp
-index 4eac3f2..845fe05 100644
+index 4eac3f2..72e4f14 100644
 --- a/src/onvif_srvd.cpp
 +++ b/src/onvif_srvd.cpp
 @@ -16,6 +16,11 @@
@@ -2559,14 +2559,14 @@ index 4eac3f2..845fe05 100644
              case LongOpts::move_preset:
                          if( !service_ctx.get_ptz_node()->set_move_preset(optarg) )
                              daemon_error_exit("Can't set process for goto preset movement: %s\n", service_ctx.get_ptz_node()->get_cstr_err());
-@@ -473,6 +501,46 @@ void check_service_ctx(void)
+@@ -473,6 +501,382 @@ void check_service_ctx(void)
  
  
  
 +// MK3: WS-Security 헤더 허용 (2026-11-05)
 +// ONVIF Device Manager·NVR 은 계정을 wsse:Security 헤더(mustUnderstand="1")로 보낸다.
 +// 이 빌드는 WSSE 플러그인 없이 만들어서 gSOAP 이 그 헤더를 모르고 MustUnderstand fault 로 모든 요청을 거부했다.
-+// 1단계: wsse:Security 만 '이해한 것으로' 넘긴다 (계정 확인은 하지 않음 - 지금도 ONVIF 는 계정 검사가 없다).
++// wsse:Security 만 '이해한 것으로' 넘기고, 계정은 아래 mk3_authorize 가 확인한다 (2단계).
 +// 그 밖의 모르는 mustUnderstand 헤더는 지금처럼 fault, mustUnderstand 아닌 모르는 요소는 지금처럼 무시.
 +static bool is_wsse_security(struct soap *soap, const char *tag)
 +{
@@ -2587,18 +2587,354 @@ index 4eac3f2..845fe05 100644
 +        return SOAP_OK;                          // 예전과 같음: 모르는 요소는 건너뜀
 +
 +    if(soap->part == SOAP_IN_HEADER && is_wsse_security(soap, tag))
-+    {
-+        static bool logged = false;
-+        if(!logged)
-+        {
-+            logged = true;
-+            fprintf(stderr, "ONVIF: WS-Security header accepted (credentials not checked)\n");
-+            fflush(stderr);
-+        }
-+        return SOAP_OK;
-+    }
++        return SOAP_OK;                          // 내용은 mk3_authorize 가 받은 원문에서 읽는다
 +
 +    return SOAP_MUSTUNDERSTAND;                  // 예전과 같음
++}
++
++
++
++// ===== MK3: ONVIF 계정 확인 (2026-11-05, 2단계) =====
++// 장비 밖에서 온 요청은 wsse:UsernameToken 의 admin + 비밀번호를 확인한다 (PasswordDigest / PasswordText).
++// 기준은 영상(edge stream_auth)과 같다: 웹에서 비밀번호를 정했으면 그것만, 아직이면 장비 시리얼(DEVICE_ID 끝).
++//  - edge 는 비밀번호를 sha256("DEVICE_ID:비밀번호") 로만 저장 -> Digest 확인에는 원문이 필요해
++//    edge 가 비밀번호를 바꿀 때 ONVIF_AUTH_FILE(root 600)에 원문을 같이 쓴다. 원문은 해시와 맞을 때만 쓴다(옛 값 무시).
++//    원문이 없으면 PasswordText 만 해시로 확인 가능, Digest 는 거부 + 로그 안내.
++//  - 장비 안(127.x) 요청, 로그인 전 조회(PRE_AUTH: GetSystemDateAndTime 등)는 계정 없이 허용
++//  - 비밀번호 5번 틀리면 그 IP 60초 잠금, 잠긴 뒤로도 틀릴 때마다 다시 잠금 (edge 와 같은 규칙, 카운터는 따로)
++//  - 비상용: ONVIF_AUTH_OFF_FILE 이 있으면 확인 안 함 (v1.0 과 같음)
++#include <openssl/sha.h>
++#include <openssl/crypto.h>
++#include <map>
++#include <string>
++#include <fstream>
++#include <sstream>
++#include <time.h>
++
++static const char *ONVIF_AUTH_FILE     = "/var/lib/onvif_srvd/onvif_auth";      // 웹 비밀번호 원문 (edge 가 씀)
++static const char *ONVIF_AUTH_OFF_FILE = "/var/lib/onvif_srvd/onvif_auth_off";  // 있으면 확인 끔
++static const char *EDGE_AUTH_FILE      = "/home/ptz/edge/.device_auth";         // edge 웹 비밀번호 해시
++static const char *DEVICE_ID_FILE      = "/var/lib/onvif_srvd/device_id";
++static const char *ONVIF_USER          = "admin";
++static const int    AUTH_MAX_FAILS     = 5;
++static const int    AUTH_LOCK_SEC      = 60;
++
++static size_t (*g_orig_frecv)(struct soap*, char*, size_t) = NULL;
++static std::string g_rx;                         // 이번 요청 원문 (앞부분 64KB)
++
++static size_t mk3_frecv(struct soap *soap, char *buf, size_t len)
++{
++    size_t n = g_orig_frecv(soap, buf, len);
++    if(n > 0 && g_rx.size() < 65536)
++        g_rx.append(buf, n < 65536 - g_rx.size() ? n : 65536 - g_rx.size());
++    return n;
++}
++
++
++
++static std::string read_file(const char *path)
++{
++    std::ifstream f(path, std::ios::binary);
++    if(!f.is_open()) return std::string();
++    std::stringstream ss; ss << f.rdbuf();
++    return ss.str();
++}
++
++static std::string trim_nl(std::string s)
++{
++    while(!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
++    size_t i = 0;
++    while(i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
++    return s.substr(i);
++}
++
++static std::string sha256_hex(const std::string &s)
++{
++    unsigned char d[SHA256_DIGEST_LENGTH];
++    SHA256((const unsigned char*)s.data(), s.size(), d);
++    char h[2 * SHA256_DIGEST_LENGTH + 1];
++    for(int i = 0; i < SHA256_DIGEST_LENGTH; ++i) snprintf(h + 2 * i, 3, "%02x", d[i]);
++    return std::string(h, 2 * SHA256_DIGEST_LENGTH);
++}
++
++static bool same(const std::string &a, const std::string &b)
++{
++    return a.size() == b.size() && CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
++}
++
++// edge .device_auth (JSON) 의 "custom_password_hash" 값. null/없음/못 읽음이면 빈 값 (edge _auth_data 와 같음)
++static std::string edge_custom_hash(void)
++{
++    std::string t = read_file(EDGE_AUTH_FILE);
++    size_t k = t.find("\"custom_password_hash\"");
++    if(k == std::string::npos) return std::string();
++    size_t c = t.find(':', k);
++    if(c == std::string::npos) return std::string();
++    size_t q1 = t.find_first_not_of(" \t\r\n", c + 1);
++    if(q1 == std::string::npos || t[q1] != '"') return std::string();   // null
++    size_t q2 = t.find('"', q1 + 1);
++    if(q2 == std::string::npos) return std::string();
++    return t.substr(q1 + 1, q2 - q1 - 1);
++}
++
++
++
++// --- 받은 원문에서 wsse:Security/UsernameToken 읽기 (접두사는 아무거나) ---
++static std::string xml_unescape(const std::string &s)
++{
++    std::string o;
++    for(size_t i = 0; i < s.size(); ++i)
++    {
++        if(s[i] != '&') { o += s[i]; continue; }
++        size_t e = s.find(';', i);
++        if(e == std::string::npos || e - i > 10) { o += s[i]; continue; }
++        std::string n = s.substr(i + 1, e - i - 1);
++        unsigned long cp = 0; bool num = false;
++        if(n == "amp") o += '&'; else if(n == "lt") o += '<'; else if(n == "gt") o += '>';
++        else if(n == "quot") o += '"'; else if(n == "apos") o += '\'';
++        else if(n.size() > 1 && n[0] == '#') { cp = (n[1] == 'x' || n[1] == 'X') ? strtoul(n.c_str() + 2, NULL, 16) : strtoul(n.c_str() + 1, NULL, 10); num = true; }
++        else { o += s[i]; continue; }
++        if(num)   // UTF-8 로
++        {
++            if(cp < 0x80) o += (char)cp;
++            else if(cp < 0x800) { o += (char)(0xC0 | (cp >> 6)); o += (char)(0x80 | (cp & 0x3F)); }
++            else if(cp < 0x10000) { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
++            else { o += (char)(0xF0 | (cp >> 18)); o += (char)(0x80 | ((cp >> 12) & 0x3F)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
++        }
++        i = e;
++    }
++    return o;
++}
++
++// [from, to) 안에서 지역 이름이 local 인 첫 시작 태그. 찾으면 태그 끝('>' 다음) 위치, 속성 문자열, 빈 요소 여부
++static size_t find_start(const std::string &x, size_t from, size_t to, const char *local,
++                         std::string *attrs, bool *empty, size_t *tag_pos = NULL)
++{
++    size_t ll = strlen(local);
++    for(size_t p = x.find('<', from); p != std::string::npos && p < to; p = x.find('<', p + 1))
++    {
++        size_t q = p + 1;
++        if(q >= to || x[q] == '/' || x[q] == '?' || x[q] == '!') continue;
++        size_t ne = q;
++        while(ne < to && !strchr(" \t\r\n/>", x[ne])) ++ne;
++        std::string name = x.substr(q, ne - q);
++        size_t colon = name.rfind(':');
++        std::string ln = colon == std::string::npos ? name : name.substr(colon + 1);
++        if(ln.size() != ll || ln.compare(0, ll, local) != 0) continue;
++        size_t gt = x.find('>', ne);
++        if(gt == std::string::npos || gt >= to) return std::string::npos;
++        if(attrs) *attrs = x.substr(ne, gt - ne);
++        if(empty) *empty = gt > ne && x[gt - 1] == '/';
++        if(tag_pos) *tag_pos = p;
++        return gt + 1;
++    }
++    return std::string::npos;
++}
++
++// 요소 local 의 텍스트 (첫 번째). 없으면 false
++static bool elem_text(const std::string &x, size_t from, size_t to, const char *local, std::string *text, std::string *attrs)
++{
++    bool empty = false;
++    size_t s = find_start(x, from, to, local, attrs, &empty);
++    if(s == std::string::npos) return false;
++    if(empty) { text->clear(); return true; }
++    size_t e = x.find("</", s);
++    if(e == std::string::npos || e > to) return false;
++    *text = xml_unescape(x.substr(s, e - s));
++    return true;
++}
++
++struct UsernameToken { bool found = false; std::string user, pass, type, nonce, created; };
++
++static UsernameToken parse_token(const std::string &x)
++{
++    UsernameToken t;
++    size_t hdr = find_start(x, 0, x.size(), "Header", NULL, NULL);
++    size_t body_tag = std::string::npos;
++    find_start(x, 0, x.size(), "Body", NULL, NULL, &body_tag);
++    if(hdr == std::string::npos) return t;
++    size_t hend = body_tag == std::string::npos ? x.size() : body_tag;   // 헤더 안에서만 찾는다
++    if(hend < hdr) return t;
++    size_t sec_tag = 0;
++    size_t sec = find_start(x, hdr, hend, "Security", NULL, NULL, &sec_tag);
++    if(sec == std::string::npos) return t;
++    size_t ut = find_start(x, sec, hend, "UsernameToken", NULL, NULL);
++    if(ut == std::string::npos) return t;
++    std::string a;
++    if(!elem_text(x, ut, hend, "Username", &t.user, NULL)) return t;
++    if(!elem_text(x, ut, hend, "Password", &t.pass, &a)) return t;
++    size_t ty = a.find("Type");
++    if(ty != std::string::npos) { size_t q1 = a.find_first_of("\"'", ty); size_t q2 = q1 == std::string::npos ? q1 : a.find(a[q1], q1 + 1);
++                                  if(q2 != std::string::npos) t.type = a.substr(q1 + 1, q2 - q1 - 1); }
++    elem_text(x, ut, hend, "Nonce", &t.nonce, NULL);
++    elem_text(x, ut, hend, "Created", &t.created, NULL);
++    t.user = trim_nl(t.user); t.nonce = trim_nl(t.nonce); t.created = trim_nl(t.created);
++    t.found = true;
++    return t;
++}
++
++
++
++// --- 잠금 (IP 별) ---
++struct FailRec { int count; time_t until; };
++static std::map<unsigned long, FailRec> g_fails;
++
++static bool ip_locked(unsigned long ip)
++{
++    auto it = g_fails.find(ip);
++    return it != g_fails.end() && it->second.until > time(NULL);
++}
++
++static bool ip_fail(unsigned long ip)      // 이번 실패로 잠겼으면 true
++{
++    if(g_fails.size() > 1024)
++        for(auto it = g_fails.begin(); it != g_fails.end(); )
++            it = (it->second.until <= time(NULL) && it->second.count < AUTH_MAX_FAILS) ? g_fails.erase(it) : std::next(it);
++    FailRec &r = g_fails[ip];
++    if(++r.count >= AUTH_MAX_FAILS) { r.until = time(NULL) + AUTH_LOCK_SEC; return true; }
++    return false;
++}
++
++
++
++static const char *PRE_AUTH_OPS[] = {    // ONVIF Core: 로그인 전 허용 (PRE_AUTH)
++    "GetSystemDateAndTime", "GetWsdlUrl", "GetServices", "GetServiceCapabilities",
++    "GetCapabilities", "GetHostname", "GetEndpointReference", NULL
++};
++
++static std::string ip_str(unsigned long ip)
++{
++    char b[32];
++    snprintf(b, sizeof(b), "%lu.%lu.%lu.%lu", (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
++    return b;
++}
++
++static void auth_log(unsigned long ip, const char *op, const char *why, bool ok)
++{
++    // 같은 IP·결과·이유는 30초에 한 번만 (ODM 은 2초마다 다시 묻는다)
++    static std::map<std::string, time_t> last;
++    std::string k = ip_str(ip) + "|" + why;
++    time_t now = time(NULL);
++    auto it = last.find(k);
++    if(it != last.end() && now - it->second < 30) return;
++    if(last.size() > 1024) last.clear();
++    last[k] = now;
++    fprintf(stderr, "ONVIF-AUTH: %s %s from %s (%s)\n", ok ? "allowed" : "DENIED", op, ip_str(ip).c_str(), why);
++    fflush(stderr);
++}
++
++
++
++// 확인 결과: true = 진행, false = 거부(why)
++static bool mk3_authorize(struct soap *soap, const char *op, const char **why)
++{
++    *why = "";
++    if(access(ONVIF_AUTH_OFF_FILE, F_OK) == 0) { *why = "auth off"; return true; }
++    if(((soap->ip >> 24) & 255) == 127)        { *why = "local"; return true; }
++    for(int i = 0; PRE_AUTH_OPS[i]; ++i)
++        if(strcmp(op, PRE_AUTH_OPS[i]) == 0)   { *why = "pre-auth"; return true; }
++
++    if(ip_locked(soap->ip)) { *why = "locked"; return false; }
++
++    UsernameToken t = parse_token(g_rx);
++    if(!t.found) { *why = "no-credentials"; return false; }   // 실패로 세지 않음
++
++    std::string dev = trim_nl(read_file(DEVICE_ID_FILE));
++    size_t dash = dev.rfind('-');
++    std::string serial = dash == std::string::npos ? std::string() : dev.substr(dash + 1);
++    if(dev.empty() || serial.empty()) { *why = "no-device-id"; return false; }   // 기준이 없으면 막는다
++
++    std::string custom = edge_custom_hash();
++    std::string plain;                         // 확인에 쓸 비밀번호 원문 (모르면 빈 값)
++    bool text_by_hash = false;
++    if(custom.empty())
++        plain = serial;
++    else
++    {
++        std::string f = read_file(ONVIF_AUTH_FILE);
++        if(!f.empty() && f.back() == '\n') f.pop_back();   // 끝 줄바꿈 하나만 (비밀번호 앞뒤 공백은 그대로)
++        if(!f.empty() && same(sha256_hex(dev + ":" + f), custom))
++            plain = f;
++        else
++            text_by_hash = true;               // 원문 없음/옛 값 -> Text 만 해시로
++    }
++
++    bool digest = t.type.find("PasswordDigest") != std::string::npos;
++    bool ok = false;
++    if(t.user != ONVIF_USER)
++        *why = "wrong-user";
++    else if(digest)
++    {
++        if(plain.empty())
++        {
++            // 비밀번호가 틀린 게 아니라 확인할 원문이 없는 것 -> 실패로 세지 않는다 (ODM 이 스스로 잠기지 않게)
++            *why = "digest-needs-password-file (set the web password again)";
++            return false;
++        }
++        else
++        {
++            int nlen = 0;
++            const char *nb = t.nonce.empty() ? "" : soap_base642s(soap, t.nonce.c_str(), NULL, 0, &nlen);
++            if(!nb) { nb = ""; nlen = 0; }
++            std::string in(nb, nlen);
++            in += t.created; in += plain;
++            unsigned char d[SHA_DIGEST_LENGTH];
++            SHA1((const unsigned char*)in.data(), in.size(), d);
++            char b64[64];
++            soap_s2base64(soap, d, b64, SHA_DIGEST_LENGTH);
++            ok = same(trim_nl(t.pass), std::string(b64));
++            if(!ok) *why = "wrong-password";
++        }
++    }
++    else
++    {
++        ok = text_by_hash ? same(sha256_hex(dev + ":" + t.pass), custom) : same(t.pass, plain);
++        if(!ok) *why = "wrong-password";
++    }
++
++    if(ok) { g_fails.erase(soap->ip); *why = digest ? "digest" : "text"; return true; }
++    if(ip_fail(soap->ip)) *why = "locked-now";
++    return false;
++}
++
++
++
++static struct Namespace *g_ns_ter = NULL;      // 응답 namespace 표 + ter (NotAuthorized fault 용)
++
++static void build_ns_ter(void)
++{
++    int n = 0;
++    while(namespaces[n].id) ++n;
++    g_ns_ter = (struct Namespace*)calloc(n + 2, sizeof(struct Namespace));
++    if(!g_ns_ter) return;
++    memcpy(g_ns_ter, namespaces, n * sizeof(struct Namespace));
++    g_ns_ter[n].id = "ter";
++    g_ns_ter[n].ns = "http://www.onvif.org/ver10/error";
++}
++
++// 이번 요청 확인. 거부했으면 fault 를 보내고 false
++static bool mk3_check_request(struct soap *soap)
++{
++    const char *op = "";
++    std::string opname;
++    if(!soap_peek_element(soap))
++    {
++        const char *c = strchr(soap->tag, ':');
++        opname = c ? c + 1 : soap->tag;
++        op = opname.c_str();
++    }
++    const char *why = "";
++    bool ok = mk3_authorize(soap, op, &why);
++    if(ok)
++    {
++        if(strcmp(why, "digest") == 0 || strcmp(why, "text") == 0) auth_log(soap->ip, op, why, true);
++        return true;
++    }
++    auth_log(soap->ip, op, why, false);
++    if(g_ns_ter) soap_set_namespaces(soap, g_ns_ter);
++    soap_sender_fault_subcode(soap, "ter:NotAuthorized", "Sender not Authorized", NULL);
++    soap_send_fault(soap);
++    return false;
 +}
 +
 +
@@ -2606,15 +2942,18 @@ index 4eac3f2..845fe05 100644
  void init_gsoap(void)
  {
      soap = soap_new();
-@@ -480,6 +548,7 @@ void init_gsoap(void)
+@@ -480,6 +884,10 @@ void init_gsoap(void)
      if(!soap)
          daemon_error_exit("Can't get mem for SOAP\n");
  
 +    soap->fignore = mk3_fignore;   // MK3: WS-Security 헤더 허용
++    g_orig_frecv  = soap->frecv;   // MK3: 계정 확인용으로 받은 원문 앞부분 보관
++    soap->frecv   = mk3_frecv;
++    build_ns_ter();
  
      soap->bind_flags = SO_REUSEADDR;
  
-@@ -505,6 +574,7 @@ void init(void *data)
+@@ -505,6 +913,7 @@ void init(void *data)
      init_signals();
      check_service_ctx();
      init_gsoap();
@@ -2622,3 +2961,18 @@ index 4eac3f2..845fe05 100644
  }
  
  
+@@ -527,10 +936,14 @@ int main(int argc, char *argv[])
+ 
+ 
+         // process service
++        g_rx.clear();
+         if( soap_begin_serve(soap) )
+         {
+             soap_stream_fault(soap, std::cerr);
+         }
++        else if( !mk3_check_request(soap) )   // MK3: 계정 확인 (거부면 fault 를 보냄)
++        {
++        }
+         FOREACH_SERVICE(DISPATCH_SERVICE, soap)
+         else
+         {

@@ -12,7 +12,9 @@
 | `presets.txt` | ONVIF 프리셋 | 줌은 저장 순간 줌카메라에서 읽은 실제 값 |
 | `home.txt` | 홈 위치 `pan tilt zoom` | SetHomePosition 때 기록, 시작 시 읽음 |
 | `ptz_watch.conf` | 이동 감시 설정 (`key = value`, 없으면 기본값) | [PTZ_STREAMING.md](PTZ_STREAMING.md) |
-| `device_id` | 장치 식별자 (MQTT 토픽) | |
+| `device_id` | 장치 식별자 (MQTT 토픽, ONVIF 계정 확인 기준) | 없으면 밖에서 오는 ONVIF 는 모두 거부 |
+| `onvif_auth` | 웹 비밀번호 원문 (root 600) | edge 가 비밀번호 변경 때 씀. ODM·NVR Digest 확인용 ([WSSE.md](WSSE.md)) |
+| `onvif_auth_off` | 있으면 ONVIF 계정 확인 끔 (비상용, v1.0 동작) | `sudo touch` 후 바로 적용, 지우면 다시 확인 |
 | `tracking_lock` | 있으면 ONVIF 이동 명령 무시 | 추적 기능이 잡고 있을 때 |
 
 `/run/onvif_srvd/` (재부팅하면 사라짐)
@@ -54,7 +56,8 @@ sudo fuser -v /dev/ttyAMA0 /dev/ttyAMA2
 | `PTZ-MON:` | 기동 후 30초, 1초마다 목표/현재 각도 |
 | `PTZ-ALERT:` | 이상 — 보드 자체 재부팅, 우리 `S` 없이 나온 보드 메시지, 모터 꺼짐, 목표 미유지, 무응답, 줌카메라 조회 실패·계정 없음. **자동 재시도 없음** |
 | `PTZ: arrived ...` / `PTZ-ALERT: NOT_REACHED·DRIFT·CORRECTION_FAILED` | 이동 감시 결과 ([PTZ_STREAMING.md](PTZ_STREAMING.md)), 바뀔 때만 |
-| `ONVIF: WS-Security header accepted (credentials not checked)` | ODM·NVR 이 계정을 붙여 접속함 (실행 후 처음 한 번) ([WSSE.md](WSSE.md)) |
+| `ONVIF-AUTH: allowed <요청> from <IP> (digest/text)` | 밖에서 계정 확인 통과 (같은 IP·결과는 30초에 한 번) ([WSSE.md](WSSE.md)) |
+| `ONVIF-AUTH: DENIED <요청> from <IP> (<이유>)` | `no-credentials` 계정 없음 · `wrong-password` · `wrong-user` · `locked-now`/`locked` 5번 틀려 60초 잠김 · `digest-needs-password-file` 원문 파일 없음(웹 비밀번호 다시 저장) · `no-device-id` |
 | `PTZ: zoom camera ...` | 줌카메라 주소·계정 출처(`account from ...`), 조회 `OK` / `OK again` (실패는 `PTZ-ALERT`, 끊길 때 한 번) |
 
 ## 장비 시험 도구 (`/home/ptz/workspace/onvif_setup`)

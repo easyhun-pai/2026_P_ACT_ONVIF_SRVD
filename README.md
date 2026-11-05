@@ -13,7 +13,8 @@ P-ACT(MK3) PTZ 카메라의 ONVIF 서버 `onvif_srvd` 개조본 — ONVIF PTZ �
 
 | 버전 | 날짜 | 바이너리 md5 | 내용 |
 |---|---|---|---|
-| **v1.0** | 2026-11-05 | `d8d6c013` | mk3-basic + 줌 위치 + 이동 감시(스트리밍 모드) + v2.4+ 펌웨어 기동 판정 + **ONVIF 계정 헤더 받기** |
+| **v1.1** | 2026-11-05 | `171ba6d8` | v1.0 + **ONVIF 계정 확인** (admin + 웹 비밀번호, 틀리면 PTZ 도 거부). edge 패치 같이 ([WSSE.md](docs/WSSE.md)) |
+| v1.0 | 2026-11-05 | `d8d6c013` | mk3-basic + 줌 위치 + 이동 감시(스트리밍 모드) + v2.4+ 펌웨어 기동 판정 + ONVIF 계정 헤더 받기 (확인은 안 함) |
 
 SW 버전 확인 (장비에서): `md5sum $(which onvif_srvd) | cut -c1-8` · 빌드 이름: `onvif_srvd --version`
 이전 빌드·정리한 브랜치 기록: [docs/VERSIONS.md](docs/VERSIONS.md)
@@ -32,7 +33,7 @@ SW 버전 확인 (장비에서): `md5sum $(which onvif_srvd) | cut -c1-8` · 빌
 | 이동 후 | 명령만 보내고 끝 | 스톨 가드 | **이동 감시(스트리밍 모드)** — 목표 기억, 도착 확인(`NOT_REACHED`), 틀어짐(`DRIFT`), 보정은 기본 꺼짐 (11-04) |
 | GetStatus | 명령값, 항상 IDLE | 같음 | **실측 위치**, MOVING/IDLE, `Error` 사유 → edge 수정 없이 플랫폼 자세가 실측 |
 | 모터 펌웨어 v2.4+ | - | - | `Q` 상태로 기동 판정 (라이다 신규 v2.5.1, 켜짐 비트는 실장비 확인 전) |
-| ONVIF 계정 헤더 | 모든 요청 거부 (`MustUnderstand`) | 같음 | **받음** — ODM·NVR 에 계정 넣고 등록 → PTZ + 영상. 계정 확인은 영상(RTSP)이 함 (11-05) |
+| ONVIF 계정 | 헤더가 붙으면 모든 요청 거부 (`MustUnderstand`), 없으면 누구나 | 같음 | **admin + 웹 비밀번호 확인** (Digest·Text) — ODM·NVR 계정 등록 → PTZ + 영상, 틀리면 PTZ 도 거부. 장비 안(127.0.0.1)은 그대로 (11-05) |
 
 자세한 설계·실측 근거·시험 결과: [docs/MK3_BASIC.md](docs/MK3_BASIC.md) · 이동 감시: [docs/PTZ_STREAMING.md](docs/PTZ_STREAMING.md) · 계정 헤더: [docs/WSSE.md](docs/WSSE.md)
 
@@ -81,7 +82,8 @@ python3 ~/workspace/onvif_setup/onvif_pan_tilt.py --quick      # 약 25초, VERD
 python3 ~/workspace/onvif_setup/onvif_move.py 0 90              # 팬 0°, 틸트 90°(수평 정면)로 이동
 sudo python3 ~/workspace/onvif_setup/onvif_zoom_test.py         # 줌 위치 시험 (줌이 잠깐 움직임), VERDICT: PASS
 python3 ~/workspace/onvif_setup/onvif_stream_test.py move 0.5 1.2   # 이동 중/후 GetStatus (실측, MOVING/IDLE, Error)
-python3 ~/workspace/onvif_setup/onvif_wsse_test.py              # 계정 헤더(WS-Security) 받기 시험, == ALL PASS
+python3 ~/workspace/onvif_setup/onvif_wsse_test.py              # 장비 안: 헤더 처리 시험, == ALL PASS
+python3 onvif_auth_test.py <장비IP> --password <웹 비밀번호>      # PC 에서: 계정 확인 시험 (tools/onvif_setup), == ALL PASS
 ```
 
 ## 먼저 읽어야 할 것
