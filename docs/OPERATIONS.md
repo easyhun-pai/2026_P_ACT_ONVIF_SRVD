@@ -14,7 +14,7 @@
 | `ptz_watch.conf` | 이동 감시 설정 (`key = value`, 없으면 기본값) | [PTZ_STREAMING.md](PTZ_STREAMING.md) |
 | `device_id` | 장치 식별자 (MQTT 토픽, ONVIF 계정 확인 기준) | 없으면 밖에서 오는 ONVIF 는 모두 거부 |
 | `onvif_auth` | 웹 비밀번호 원문 (root 600) | edge 가 비밀번호 변경 때 씀. ODM·NVR Digest 확인용 ([WSSE.md](WSSE.md)) |
-| `onvif_auth_off` | 있으면 ONVIF 계정 확인 끔 (비상용, v1.0 동작) | `sudo touch` 후 바로 적용, 지우면 다시 확인 |
+| `onvif_auth_off` | 있으면 ONVIF 계정 확인 끔 (비상용) | `sudo touch` 후 바로 적용, 지우면 다시 확인 |
 | `tracking_lock` | 있으면 ONVIF 이동 명령 무시 | 추적 기능이 잡고 있을 때 |
 
 `/run/onvif_srvd/` (재부팅하면 사라짐)

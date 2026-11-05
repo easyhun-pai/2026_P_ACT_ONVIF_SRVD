@@ -74,7 +74,7 @@ binary md5: {md5}
   sudo install -m 755 onvif_start.sh /home/ptz/edge/onvif_start.sh
   sudo systemctl start onvif_srvd
 
-  # 2b) edge 패치 (ONVIF 계정 확인 v1.1 — 웹 비밀번호 변경 때 원문 파일도 씀)
+  # 2b) edge 패치 (ONVIF 계정 확인 — 웹 비밀번호 변경 때 원문 파일도 씀)
   sudo python3 edge_onvif_auth_patch.py /home/ptz/edge/settings_handler.py && sudo systemctl restart edge-settings
   #     이미 웹 비밀번호를 정한 장비: 원문 파일을 한 번 만들어야 ODM·NVR(Digest)이 됨 (틀린 값이면 쓰이지 않음)
   #     sudo sh -c "umask 077; printf '%s' '<웹 비밀번호>' > /var/lib/onvif_srvd/onvif_auth"

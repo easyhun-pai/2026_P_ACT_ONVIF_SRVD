@@ -153,17 +153,17 @@ dispatcher 를 `try-restart` + IP 비교로 수정 ([INCIDENT-261027](incidents/
 ### 11-05 · ONVIF 계정 헤더(WS-Security) 받기 → v1.0
 - 증상: ODM·NVR 에 계정을 넣으면 onvif 가 모든 요청을 `MustUnderstand` 로 거부, 계정을 빼면 영상(RTSP)이 401. 원본부터 있던 문제
 - `wsse:Security` 헤더만 받아 넘김 (계정 확인은 안 함, 링크 라이브러리 그대로)
-- ptz018 시험 통과 (빌드 `d8d6c013`, **v1.0**): 자동 시험 33/33, ODM 계정 등록 → 장비 정보·PTZ·프리셋·영상 — [WSSE.md](WSSE.md)
+- ptz018 시험 통과 (빌드 `d8d6c013`): 자동 시험 33/33, ODM 계정 등록 → 장비 정보·PTZ·프리셋·영상 — [WSSE.md](WSSE.md)
 
-### 11-05 · ONVIF 계정 확인 → v1.1
-- v1.0 은 계정 헤더를 받기만 해서 ODM 에 아무 비밀번호나 넣어도 PTZ 가 됨 (영상만 막힘)
+### 11-05 · ONVIF 계정 확인 → v1.0
+- 헤더 받기만 한 빌드(`d8d6c013`)는 ODM 에 아무 비밀번호나 넣어도 PTZ 가 됨 (영상만 막힘)
 - admin + 웹 비밀번호 확인 (Digest·Text), 장비 안·로그인 전 조회는 허용, 5번 틀리면 60초 잠금
 - edge 는 비밀번호를 해시로만 저장 → 비밀번호 변경 때 원문을 root 전용 파일에 같이 쓰는 edge 패치
-- ptz018 시험 통과 (빌드 `171ba6d8`, **v1.1**): 예외 상황 포함 114건 — [WSSE.md](WSSE.md)
+- ptz018 시험 통과: 예외 상황 포함 114건, ODM 실기 확인 — [WSSE.md](WSSE.md). **v1.0 = 빌드 `e4d4621a`** (같은 코드를 v1.1 이름으로 빌드한 `171ba6d8` 은 v1.0 으로 합침)
   - 시험 중 버그 1건 수정: 원문 파일이 없어 Digest 를 확인 못 한 것까지 실패로 세서 ODM 이 스스로 잠김
 
 ### 남은 일
-- [ ] edge onvif-deps.tar.gz 에 v1.1(`171ba6d8`) + edge 패치(`deploy/edge_onvif_auth_patch.py`) 반영
+- [ ] edge onvif-deps.tar.gz 에 v1.0(`e4d4621a`) + edge 패치(`deploy/edge_onvif_auth_patch.py`) 반영
 - [ ] 모터 펌웨어 v2.5.1 실장비에서 Q 켜짐 비트 확인 (라이다는 Debian 13 에서 빌드)
 - [ ] 줌카메라 비밀번호 교체 검토 (예전 소스 이력·07-28 공개 패키지에 남아 있음)
 - [ ] 콜드부팅 후 처진 자세 유지가 맞는지, 30초 대기가 적절한지 확인 (확인 필요)

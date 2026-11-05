@@ -38,9 +38,9 @@ onvif_setup — ONVIF(mk3-basic) 장비 시험 도구
 
 6) 계정 헤더 처리 시험 (장비 안) — 조회만, 모터 안 움직임
    python3 onvif_wsse_test.py                     # 헤더 없음·계정 헤더 여러 형태 → 200, 모르는 필수 헤더 → 500
-   장비 안(127.0.0.1)은 계정 확인을 하지 않으므로 v1.1 에서도 PASS. 마지막 줄 == ALL PASS
+   장비 안(127.0.0.1)은 계정 확인을 하지 않으므로 PASS. 마지막 줄 == ALL PASS
 
-7) 계정 확인 시험 (PC 에서, v1.1) — 조회만, 모터 안 움직임
+7) 계정 확인 시험 (PC 에서) — 조회만, 모터 안 움직임
    python3 onvif_auth_test.py <장비IP> --password <웹 비밀번호>              # 맞는/틀린 계정, 이상한 헤더, 서버 생존
    python3 onvif_auth_test.py <장비IP> --password <웹 비밀번호> --lockout    # + 잠금 (이 PC 가 약 60초 잠김)
    python3 onvif_auth_test.py <장비IP> --password <웹 비밀번호> --expect-digest-fail   # 원문 파일 없는 장비

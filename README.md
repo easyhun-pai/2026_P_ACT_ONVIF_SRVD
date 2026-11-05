@@ -13,8 +13,7 @@ P-ACT(MK3) PTZ 카메라의 ONVIF 서버 `onvif_srvd` 개조본 — ONVIF PTZ �
 
 | 버전 | 날짜 | 바이너리 md5 | 내용 |
 |---|---|---|---|
-| **v1.1** | 2026-11-05 | `171ba6d8` | v1.0 + **ONVIF 계정 확인** (admin + 웹 비밀번호, 틀리면 PTZ 도 거부). edge 패치 같이 ([WSSE.md](docs/WSSE.md)) |
-| v1.0 | 2026-11-05 | `d8d6c013` | mk3-basic + 줌 위치 + 이동 감시(스트리밍 모드) + v2.4+ 펌웨어 기동 판정 + ONVIF 계정 헤더 받기 (확인은 안 함) |
+| **v1.0** | 2026-11-05 | `e4d4621a` | mk3-basic + 줌 위치 + 이동 감시(스트리밍 모드) + v2.4+ 펌웨어 기동 판정 + **ONVIF 계정 확인** (admin + 웹 비밀번호, edge 패치 같이 — [WSSE.md](docs/WSSE.md)) |
 
 SW 버전 확인 (장비에서): `md5sum $(which onvif_srvd) | cut -c1-8` · 빌드 이름: `onvif_srvd --version`
 이전 빌드·정리한 브랜치 기록: [docs/VERSIONS.md](docs/VERSIONS.md)
