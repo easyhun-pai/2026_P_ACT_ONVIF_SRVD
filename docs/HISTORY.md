@@ -150,28 +150,32 @@ dispatcher 를 `try-restart` + IP 비교로 수정 ([INCIDENT-261027](incidents/
 - 라이다 신규 모터 펌웨어 v2.5.1 은 꺼져 있어도 offset 을 보고 → `Q` 상태로 판정
 - ptz018 시험 통과 (빌드 `536e432e`), 11-05 손 밀기 시험 통과 — [PTZ_STREAMING.md](PTZ_STREAMING.md)
 
-### 11-05 · ONVIF 계정 헤더(WS-Security) 받기 → v1.0
+### 11-05 · ONVIF 계정 헤더(WS-Security) 받기 → v1.0.0
 - 증상: ODM·NVR 에 계정을 넣으면 onvif 가 모든 요청을 `MustUnderstand` 로 거부, 계정을 빼면 영상(RTSP)이 401. 원본부터 있던 문제
 - `wsse:Security` 헤더만 받아 넘김 (계정 확인은 안 함, 링크 라이브러리 그대로)
 - ptz018 시험 통과 (빌드 `d8d6c013`): 자동 시험 33/33, ODM 계정 등록 → 장비 정보·PTZ·프리셋·영상 — [WSSE.md](WSSE.md)
 
-### 11-05 · ONVIF 계정 확인 → v1.0
+### 11-05 · ONVIF 계정 확인 → v1.0.0
 - 헤더 받기만 한 빌드(`d8d6c013`)는 ODM 에 아무 비밀번호나 넣어도 PTZ 가 됨 (영상만 막힘)
 - admin + 웹 비밀번호 확인 (Digest·Text), 장비 안·로그인 전 조회는 허용, 5번 틀리면 60초 잠금
 - edge 는 비밀번호를 해시로만 저장 → 비밀번호 변경 때 원문을 root 전용 파일에 같이 쓰는 edge 패치
 - ptz018 시험 통과: 예외 상황 포함 114건, ODM 실기 확인 — [WSSE.md](WSSE.md). **v1.0 = 빌드 `e4d4621a`** (같은 코드를 v1.1 이름으로 빌드한 `171ba6d8` 은 v1.0 으로 합침)
   - 시험 중 버그 1건 수정: 원문 파일이 없어 Digest 를 확인 못 한 것까지 실패로 세서 ODM 이 스스로 잠김
 
-### 11-05 · 프리셋 이름 띄어쓰기·한글 → v1.0 (`8a8bc609`)
+### 11-05 · 프리셋 이름 띄어쓰기·한글 → v1.0.0 (`8a8bc609`)
 - 점검 중 발견. `presets.txt` 를 이름 한 단어만 읽어서, "Front door" 처럼 띄어쓰기가 있으면 뒤 프리셋들이 한 칸씩 밀려
   엉뚱한 위치로 가거나 사라짐 → 다음 프리셋 저장·삭제 때 그대로 덮어씀 (원본부터 있던 문제)
 - 한글 이름이 깨짐 ("정문 입구" → 깨진 바이트) — gSOAP 기본 모드가 글자마다 아래 1바이트만 남김 → `SOAP_C_UTFSTRING`
 - 이름은 줄 끝까지 읽음 (edge `ptz_api.py` 와 같은 방식, 파일 형식 그대로), 깨진 줄은 그 줄만 버림, 저장은 임시 파일 → 바꿔 넣기,
   token 띄어쓰기는 `_`, 이름 줄바꿈·탭은 공백
-- ptz018 시험: `onvif_preset_name_test.py` 25건 + 계정 시험(43·17·장비 안) 다시 PASS. **v1.0 = 빌드 `8a8bc609`**
+- ptz018 시험: `onvif_preset_name_test.py` 25건 + 계정 시험(43·17·장비 안) 다시 PASS. **v1.0.0 = 빌드 `8a8bc609`**
+
+### 11-10 · 모터 헬스 → v1.1.0 (`a8e37f1f`, 브랜치 [`feat/motor-health`](https://github.com/easyhun-pai/2026_P_ACT_ONVIF_SRVD/tree/feat/motor-health), main 병합 전)
+- 라이다 모터 펌웨어 v2.4+ 의 추정 온도·발열·과열 트립을 기록·경보. poe002 시험, ptz018 회귀 14/14 — 자세한 기록은 브랜치 HISTORY·MOTOR_GUARD
+- 버전 이름 3자리로: 태그 `v1.0` → `v1.0.0`
 
 ### 남은 일
-- [ ] edge onvif-deps.tar.gz 에 v1.0(`8a8bc609`) + edge 패치(`deploy/edge_onvif_auth_patch.py`) 반영
+- [ ] edge onvif-deps.tar.gz 에 v1.0.0(`8a8bc609`) + edge 패치(`deploy/edge_onvif_auth_patch.py`) 반영
 - [ ] 모터 펌웨어 v2.5.1 실장비에서 Q 켜짐 비트 확인 (라이다는 Debian 13 에서 빌드)
 - [ ] 줌카메라 비밀번호 교체 검토 (예전 소스 이력·07-28 공개 패키지에 남아 있음)
 - [ ] 콜드부팅 후 처진 자세 유지가 맞는지, 30초 대기가 적절한지 확인 (확인 필요)

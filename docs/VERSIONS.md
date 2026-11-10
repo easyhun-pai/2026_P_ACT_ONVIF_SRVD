@@ -6,7 +6,8 @@ SW 버전 = 바이너리 md5 앞 8자리. 장비에서 `md5sum $(which onvif_srv
 
 | 버전 | 날짜 | md5 | 빌드 이름 (`MK3_BUILD_INFO`) | 내용 | 검증 |
 |---|---|---|---|---|---|
-| **v1.0** | 2026-11-05 | `8a8bc609` | mk3-basic v1.0 2026-11-05 | 아래 stream+q + **ONVIF 계정 확인** (admin + 웹 비밀번호, Digest·Text) + edge 패치 ([WSSE.md](WSSE.md)) + **프리셋 이름 띄어쓰기·한글** | ptz018: 계정 114건 + 프리셋 이름 25건 PASS, ODM 실기 |
+| v1.1.0 | 2026-11-10 | `a8e37f1f` | mk3-basic v1.1.0 2026-11-10 | v1.0.0 + **모터 헬스** (Q 펌웨어 v2.4+ 축: 추정 온도·발열·Vq·트립 → live·`motor_health.json`·MQTT `<topic>_health`·`PTZ-HEALTH` 로그·경보, GetStatus `MOTOR_OVERHEAT`). **브랜치 [`feat/motor-health`](https://github.com/easyhun-pai/2026_P_ACT_ONVIF_SRVD/tree/feat/motor-health) (`e6682cd`), main 병합 전** | poe002(v2.5.1): 출력·경보·전 범위. ptz018(Pro): 회귀 14/14 |
+| **v1.0.0** | 2026-11-05 | `8a8bc609` | mk3-basic v1.0 2026-11-05 | 아래 stream+q + **ONVIF 계정 확인** (admin + 웹 비밀번호, Digest·Text) + edge 패치 ([WSSE.md](WSSE.md)) + **프리셋 이름 띄어쓰기·한글** | ptz018: 계정 114건 + 프리셋 이름 25건 PASS, ODM 실기 |
 | (중간) | 2026-11-05 | `e4d4621a` | mk3-basic v1.0 2026-11-05 | 계정 확인까지. 프리셋 이름에 띄어쓰기가 있으면 뒤 프리셋이 밀려 망가짐, 한글 이름 깨짐 → `8a8bc609` 로 바꿀 것 | ptz018: 114건, ODM 실기 |
 | (중간) | 2026-11-05 | `171ba6d8` | mk3-basic v1.1 2026-11-05 | v1.0 과 같은 코드, 빌드 이름만 v1.1 → v1.0 으로 합침 | ptz018 |
 | (중간) | 2026-11-05 | `d8d6c013` | mk3-basic v1.0 2026-11-05 | stream+q + 계정 헤더 받기만 — **확인은 안 함** (아무 비밀번호로 PTZ 가능). 쓰지 말 것 | ptz018: 자동 시험 33/33, ODM 계정 등록 → 정보·PTZ·프리셋·영상 |
@@ -17,13 +18,16 @@ SW 버전 = 바이너리 md5 앞 8자리. 장비에서 `md5sum $(which onvif_srv
 | v8 guard | 2026-07-29 | `e688771b` | - | 스톨 가드 (이전 개조, [HISTORY.md](HISTORY.md)) | .28 |
 | 현장 원본 | 2026-07-28 | `448443cd` | - | 부팅 때 R→S, 가드 없음. edge onvif-deps 기본 | - |
 
-아래 순서로 쌓인다: 원본 upstream `df09d0a` → mk3-basic(03f·03g) → zoomfix → stream+q → 계정 헤더 받기 → 계정 확인 → **v1.0** (+ 프리셋 이름).
-태그 `v1.0` 은 계정 확인까지 넣은 커밋. 잠깐 있던 태그 `v1.1` 은 지웠다 (2026-11-05).
+아래 순서로 쌓인다: 원본 upstream `df09d0a` → mk3-basic(03f·03g) → zoomfix → stream+q → 계정 헤더 받기 → 계정 확인 → **v1.0.0** (+ 프리셋 이름).
+태그 `v1.0.0` 은 계정 확인·프리셋 이름까지 넣은 main 커밋 (`105fd06`). 2026-11-10 에 `v1.0` 에서 이름을 바꿨다 (edge 와 같은 3자리 형식). 잠깐 있던 태그 `v1.1` 은 지웠다 (2026-11-05).
+태그 `v1.1.0` 은 브랜치 `feat/motor-health` 의 커밋 (`e6682cd`). 빌드 이름 칸의 `mk3-basic v1.0` 은 빌드할 때 넣은 이름이라 그대로 둔다.
+버전 규칙 (2026-11-10~): `주.부.수` — 호환이 깨지면 주, 기능 추가는 부, 버그 수정·작은 변경은 수.
+바이너리·설치 묶음: 사내 저장소 Releases (비공개) — v1.0.0, v1.1.0.
 배포 묶음: `python3 tools/make_package.py --binary <onvif_srvd>` → `onvif_mk3_basic_<날짜>_<md5>.zip`.
 
 ## 정리한 브랜치 (2026-11-05)
 
-v1.0 을 main 에 합치며 작업 브랜치를 지웠다. 내용은 모두 main 에 있다.
+v1.0(.0) 을 main 에 합치며 작업 브랜치를 지웠다. 내용은 모두 main 에 있다.
 main 위로 다시 쌓아서 커밋 번호가 바뀌었다 (메시지·내용 같음).
 
 ### 사내 저장소 (비공개)
@@ -50,6 +54,6 @@ main 위로 다시 쌓아서 커밋 번호가 바뀌었다 (메시지·내용 �
 | `feat/zoom-position` | `962af24` | 줌 위치 수정 (공개용 정리본). v1.0 정리본 커밋에 포함 |
 
 ## 다음 버전에서 할 것
-- edge onvif-deps.tar.gz 에 v1.0 반영 (지금 edge 패키지 업데이트는 원본 `448443` 으로 덮어씀)
+- edge onvif-deps.tar.gz 에 v1.0.0 반영 (지금 edge 패키지 업데이트는 원본 `448443` 으로 덮어씀)
 - 현장 NVR 한 종류로 계정 등록 확인
 - 모터 펌웨어 v2.5.1 실장비에서 Q 켜짐 비트 확인 — [PTZ_STREAMING.md](PTZ_STREAMING.md)

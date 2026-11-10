@@ -13,7 +13,11 @@ P-ACT(MK3) PTZ 카메라의 ONVIF 서버 `onvif_srvd` 개조본 — ONVIF PTZ �
 
 | 버전 | 날짜 | 바이너리 md5 | 내용 |
 |---|---|---|---|
-| **v1.0** | 2026-11-05 | `8a8bc609` | mk3-basic + 줌 위치 + 이동 감시(스트리밍 모드) + v2.4+ 펌웨어 기동 판정 + **ONVIF 계정 확인** (admin + 웹 비밀번호, edge 패치 같이 — [WSSE.md](docs/WSSE.md)) + 프리셋 이름 띄어쓰기·한글 |
+| **v1.0.0** | 2026-11-05 | `8a8bc609` | mk3-basic + 줌 위치 + 이동 감시(스트리밍 모드) + v2.4+ 펌웨어 기동 판정 + **ONVIF 계정 확인** (admin + 웹 비밀번호, edge 패치 같이 — [WSSE.md](docs/WSSE.md)) + 프리셋 이름 띄어쓰기·한글 |
+| v1.1.0 | 2026-11-10 | `a8e37f1f` | v1.0.0 + **모터 헬스**: 라이다 모터(펌웨어 v2.4+) 추정 온도·발열·과열 트립 기록·경보, `motor_health.json`, GetStatus `MOTOR_OVERHEAT`. Pro(구형 펌웨어)는 동작 같음. **브랜치 [`feat/motor-health`](https://github.com/easyhun-pai/2026_P_ACT_ONVIF_SRVD/tree/feat/motor-health) (main 병합 전)** — 설명 [MOTOR_GUARD.md](https://github.com/easyhun-pai/2026_P_ACT_ONVIF_SRVD/tree/feat/motor-health/docs/MOTOR_GUARD.md) |
+
+main = **v1.0.0**. 버전은 `주.부.수` (edge 와 같은 3자리): 호환이 깨지면 주, 기능 추가는 부, 버그 수정·작은 변경은 수.
+바이너리·설치 묶음은 사내 저장소 Releases 에만 둔다 (비공개). 이 저장소는 소스·문서.
 
 SW 버전 확인 (장비에서): `md5sum $(which onvif_srvd) | cut -c1-8` · 빌드 이름: `onvif_srvd --version`
 이전 빌드·정리한 브랜치 기록: [docs/VERSIONS.md](docs/VERSIONS.md)

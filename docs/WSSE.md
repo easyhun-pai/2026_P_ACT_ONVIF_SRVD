@@ -1,4 +1,4 @@
-# ONVIF 계정 (WS-Security) — v1.0 (2026-11-05)
+# ONVIF 계정 (WS-Security) — v1.0.0 (2026-11-05)
 
 ## 문제
 ONVIF Device Manager(ODM)·NVR 은 계정을 `wsse:Security` 헤더(`mustUnderstand="1"`)로 보낸다.
@@ -7,7 +7,7 @@ ONVIF Device Manager(ODM)·NVR 은 계정을 `wsse:Security` 헤더(`mustUnderst
 |---|---|---|
 | 원본 ~ stream+q | ONVIF 가 모든 요청 거부 (`MustUnderstand`) | ONVIF 는 되지만 영상(RTSP) 401 |
 | 중간 빌드 `d8d6c013` | ONVIF 받음, **확인은 안 함 → 아무 비밀번호로 PTZ 가능** (영상만 막힘) | 같음 |
-| **v1.0** (`8a8bc609`) | **admin + 웹 비밀번호 확인** — 맞으면 PTZ·영상, 틀리면 둘 다 거부 | 밖에서는 거부 (장비 안은 허용) |
+| **v1.0.0** (`8a8bc609`) | **admin + 웹 비밀번호 확인** — 맞으면 PTZ·영상, 틀리면 둘 다 거부 | 밖에서는 거부 (장비 안은 허용) |
 
 ## 규칙 (`src/onvif_srvd.cpp` `mk3_authorize`)
 
