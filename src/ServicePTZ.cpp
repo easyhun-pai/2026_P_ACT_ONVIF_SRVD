@@ -26,14 +26,17 @@
       - 줌카메라 계정: env ZOOM_CAM_USER/ZOOM_CAM_PASS > mediamtx.yml detection_zoom (소스에 계정 없음, 못 찾으면 줌 끔)
    8. 스트리밍 모드 (2026-11-04, 요청서 PTZ_스트리밍모드_요청_2026-11-04)
       - 마지막 이동 목표를 기억하고 실측(엔코더)과 비교: 도착 확인(NOT_REACHED), 도착 뒤 틀어짐(DRIFT)
-      - GetStatus: Position = 실측, MoveStatus = MOVING/IDLE, Error = NOT_REACHED/DRIFT/MOTOR_OFF/NO_REPLY/CORRECTION_FAILED
+      - GetStatus: Position = 실측, MoveStatus = MOVING/IDLE, Error = NOT_REACHED/DRIFT/MOTOR_OFF/MOTOR_OVERHEAT/NO_REPLY/CORRECTION_FAILED
       - 자동 보정(기본 꺼짐): 느린 램프로 최대 correct_max 번, 간격 correct_gap_s, 실패하면 포기
       - 설정 /var/lib/onvif_srvd/ptz_watch.conf (key=value), live 파일에 watch 줄
    9. 모터 펌웨어 v2.4+ (라이다 신규 v2.5.1) 기동 판정 (2026-11-04)
       - v2.5.1 은 꺼져 있어도 Sensor offset 을 보고 -> 'Q' 상태의 켜짐 비트로 판정 (구 펌웨어는 기존 offset 판정)
-      - 켜짐 비트(0x0001)는 가정. 틀리면 안전 쪽(꺼짐 판정 -> S + 자세 유지), 기동 후 스스로 검증해 로그
+      - 켜짐 비트(0x0001)는 제작사 안내로 확인 (11-10). 기동 후 스스로 검증해 로그
   10. 프리셋 이름 띄어쓰기 (2026-11-05): presets.txt 이름을 줄 끝까지 읽는다 (edge ptz_api.py 와 같음).
       깨진 줄은 그 줄만 버리고, 저장은 임시 파일에 쓴 뒤 바꿔 넣는다
+  11. 모터 헬스 (2026-11-10, 제작사 과열 보호 안내 - docs/MOTOR_GUARD.md): Q 펌웨어(v2.4+) 축만
+      - 0.5초마다 Q -> 추정 온도·발열·Vq·트립: live 파일, /run/onvif_srvd/motor_health.json, MQTT <topic>_health,
+        PTZ-HEALTH 주기 로그, 과열 트립·냉각·드라이버 오류·발열/온도 기준 초과 PTZ-ALERT. 모터 명령은 보내지 않음
 
  Pan/Tilt : /dev/ttyAMA0, /dev/ttyAMA2 (115200, 'T<rad>\n')
  Zoom     : 줌카메라(기본 192.168.1.68) ONVIF SOAP 직접 호출
@@ -419,9 +422,9 @@ static void query_version(AxisInfo& a) {
 // 응답: "Q" + 16진 64자 = 32바이트 little-endian 레코드, 끝 2바이트 = 앞 30바이트의 CRC-16/CCITT-FALSE
 //   [0] 형식 [1] 순번 [2..3] 플래그 [4..5] 목표 mrad [6..7] 현재 mrad [12..13] 전압 제한 mV [14..15] 모터 추정 온도 0.01C
 //   [18..19] 실내 0.01C [20..21] 과열 차단 0.01C [26..29] 가동 ms   (poe002 v2.5.1 실측 3건, CRC 일치)
-// 켜짐(동작) 비트: 제조사 문서를 못 봐서 0x0001 로 가정 (꺼진 상태 실측 플래그 0x0186 에서 0).
-//   가정이 틀리면 '항상 꺼짐'으로 판정 -> 재시작 때 S + 지금 자세 유지 (안전, 짧은 움찔만).
-//   우리가 켠 뒤에도 0 이면 가정이 틀린 것 -> 그 축은 Q 로 하는 '모터 꺼짐' 감시를 끈다 (g_qbit, 오경보 방지).
+//   [8..9] 속도 mrad/s [10..11] 인가 전압 Vq mV [16..17] 발열 0.01W [22..23] 트립 횟수 [24..25] FOC Hz
+// 켜짐(동작) 비트 0x0001: 제작사 안내(2026-11-10)로 확인 (처음엔 가정, 꺼진 상태 실측 0x0186 에서 0).
+//   켠 뒤에도 0 이면 그 축은 Q 로 하는 '모터 꺼짐' 감시를 끈다 (g_qbit, 오경보 방지).
 static uint16_t Q_RUN_BIT = 0x0001;   // ptz_watch.conf 의 q_run_bit = 0x.... 로 바꿀 수 있음 (실장비 확인 후)
 static std::atomic<int> g_qbit[2];   // 0 미확인, 1 확인(켜진 상태에서 비트 1 을 봄), 2 틀림(켰는데 0)
 
@@ -434,8 +437,25 @@ static uint16_t crc16_ccitt_false(const uint8_t* d, size_t n) {
     return c;
 }
 
-// "Q0100860110FF..." 한 줄 -> 플래그/목표/현재. CRC 가 틀리면 false
-static bool parse_q_line(const std::string& l, uint16_t& flags, float& tgt, float& cur) {
+// Q 플래그 비트 (제작사 안내 2026-11-10, docs/MOTOR_GUARD.md)
+static const uint16_t QF_DRIVER_FAULT = 0x0010;   // bit4 드라이버 오류 (F 로 해제)
+static const uint16_t QF_GUARD_TRIP   = 0x0020;   // bit5 과열 트립 (다음 S 까지)
+static const uint16_t QF_COOLING      = 0x0040;   // bit6 냉각 중 (S 거부, 55 C 아래로 식을 때까지)
+
+// Q 레코드 (레이아웃 1). 온도·발열은 보드가 Vq 로 계산한 추정값 (센서 없음)
+struct QRec {
+    uint8_t  layout = 0;
+    uint16_t flags = 0;
+    float    tgt = 0, cur = 0, vel = 0;      // rad, rad, rad/s
+    float    vq = 0, vlim = 0;               // V
+    float    temp = 0, heat = 0;             // C, W
+    float    room = 0, trip = 0;             // C
+    uint16_t trips = 0, foc_hz = 0;
+    uint32_t up_ms = 0;
+};
+
+// "Q0100860110FF..." 한 줄 -> 레코드. CRC 가 틀리면 false
+static bool parse_q_rec(const std::string& l, QRec& q) {
     size_t p = l.find('Q');
     if (p == std::string::npos || l.size() < p + 65) return false;
     uint8_t b[32];
@@ -445,9 +465,29 @@ static bool parse_q_line(const std::string& l, uint16_t& flags, float& tgt, floa
         b[i] = (uint8_t)strtol(h, nullptr, 16);
     }
     if (crc16_ccitt_false(b, 30) != (uint16_t)(b[30] | (b[31] << 8))) return false;
-    flags = (uint16_t)(b[2] | (b[3] << 8));
-    tgt = (int16_t)(b[4] | (b[5] << 8)) / 1000.0f;
-    cur = (int16_t)(b[6] | (b[7] << 8)) / 1000.0f;
+    auto u16 = [&](int o) { return (uint16_t)(b[o] | (b[o + 1] << 8)); };
+    auto i16 = [&](int o) { return (int16_t)u16(o); };
+    q.layout = b[0];
+    q.flags  = u16(2);
+    q.tgt    = i16(4) / 1000.0f;
+    q.cur    = i16(6) / 1000.0f;
+    q.vel    = i16(8) / 1000.0f;
+    q.vq     = i16(10) / 1000.0f;
+    q.vlim   = u16(12) / 1000.0f;
+    q.temp   = i16(14) / 100.0f;
+    q.heat   = u16(16) / 100.0f;
+    q.room   = i16(18) / 100.0f;
+    q.trip   = i16(20) / 100.0f;
+    q.trips  = u16(22);
+    q.foc_hz = u16(24);
+    q.up_ms  = (uint32_t)b[26] | ((uint32_t)b[27] << 8) | ((uint32_t)b[28] << 16) | ((uint32_t)b[29] << 24);
+    return true;
+}
+
+static bool parse_q_line(const std::string& l, uint16_t& flags, float& tgt, float& cur) {
+    QRec q;
+    if (!parse_q_rec(l, q)) return false;
+    flags = q.flags; tgt = q.tgt; cur = q.cur;
     return true;
 }
 
@@ -591,6 +631,11 @@ struct WatchCfg {
     int   correct_max      = 2;       // 한 목표당 최대 보정 횟수, 넘으면 CORRECTION_FAILED 로 포기
     float correct_gap_s    = 10.0f;
     bool  status_real      = true;    // GetStatus Position: true=실측, false=예전처럼 명령값
+    // 모터 헬스 (Q 펌웨어 v2.4+ 만). 제작사: 셋업 때 유지 발열 5.5 W 이하로 맞춤, 27 C 기준 계속 견딜 수 있는 발열 6.9 W, 트립 70 C
+    float heat_warn_w      = 5.5f;    // 발열이 이 값 이상으로 heat_warn_s 동안 이어지면 PTZ-ALERT (걸림·간섭 조기 발견)
+    float heat_warn_s      = 30.0f;
+    float temp_warn_c      = 60.0f;   // 추정 온도 경고 (트립 70 C 전에)
+    int   health_log_s     = 300;     // PTZ-HEALTH 주기 기록 (그 사이 최고 온도·발열 포함). 0 = 끔
 };
 static WatchCfg g_wcfg;
 static const char* WATCH_CFG_PATH = "/var/lib/onvif_srvd/ptz_watch.conf";
@@ -712,15 +757,34 @@ struct Telem {
     std::atomic<uint64_t> us{0};
     std::atomic<uint32_t> qflags{0};      // 마지막 Q 플래그 (v2.4+)
     std::atomic<uint64_t> q_us{0};
+    std::mutex qmtx;                      // q 보호
+    QRec       q;                         // 마지막 Q 레코드 전체 (모터 헬스)
 };
 static Telem g_tel[2];
 static std::atomic<uint64_t> g_s_sent_us[2];   // 우리가 S를 보낸 시각 (직후 MOT 메시지는 정상)
 
+static bool tel_last_q(int i, QRec& q, uint64_t& us) {
+    us = g_tel[i].q_us.load();
+    if (!us) return false;
+    std::lock_guard<std::mutex> lk(g_tel[i].qmtx);
+    q = g_tel[i].q;
+    return true;
+}
+
 static void handle_mcu_line(int i, const std::string& l) {
     const char* nm = g_ax[i].name;
     if (!l.empty() && l[0] == 'Q') {
-        uint16_t f; float qt, qc;
-        if (parse_q_line(l, f, qt, qc)) { g_tel[i].qflags.store(f); g_tel[i].q_us.store(now_us()); }
+        QRec q;
+        if (parse_q_rec(l, q)) {
+            { std::lock_guard<std::mutex> lk(g_tel[i].qmtx); g_tel[i].q = q; }
+            g_tel[i].qflags.store(q.flags); g_tel[i].q_us.store(now_us());
+        }
+        return;
+    }
+    // v2.4+ 과열 보호 알림 (예: "Guard: motor temperature estimate 70 C. Motor disabled. Send S to restart after it cools.")
+    // 'I' 응답의 "Guard: GL35 (by axis) estimate ..." 줄은 시작 조회 때만 오므로 여기 오지 않는다.
+    if (l.compare(0, 6, "Guard:") == 0) {
+        PTZ_LOG("PTZ-ALERT: %s board says: %s\n", nm, l.c_str());
         return;
     }
     size_t p = l.find("Target angle");
@@ -804,11 +868,13 @@ static bool q_query(int i, uint16_t& flags, int timeout_ms = 300) {
 //  - Q 펌웨어: 켜짐 비트가 확인된 축만 Q 로 판정. 확인 전/틀림이면 판정하지 않음
 //    (v2.5.1 은 꺼져도 offset 이 남아 offset 으로는 못 본다 -> 그 경우 꺼짐 감지 없음, 시작 로그에 남김)
 static std::atomic<bool> g_motor_off[2];
+static std::atomic<bool> g_overheat[2];   // Q 과열 트립 또는 냉각 중 (GetStatus Error = MOTOR_OVERHEAT)
+// Q 펌웨어는 켜짐 비트 확인 여부와 상관없이 매번 Q 를 묻는다 (모터 헬스 기록용, 0.5초 = 2 Hz, 제작사 한도 20 Hz)
 static bool axis_motor_off(int i, float o) {
     if (!g_ax[i].has_q) return fabsf(o) <= OFFSET_ZERO_EPS;
-    if (g_qbit[i].load() != 1) return false;
     uint16_t f;
     if (!q_query(i, f)) return false;     // 무응답은 T 쪽 감시가 따로 잡는다
+    if (g_qbit[i].load() != 1) return false;
     return !(f & Q_RUN_BIT);
 }
 
@@ -853,12 +919,18 @@ static void watch_load_cfg() {
         else if (k == "correct_gap_s")    g_wcfg.correct_gap_s    = clampf(x, 2.0f, 600.0f);
         else if (k == "status_position")  g_wcfg.status_real      = (v != "target");
         else if (k == "q_run_bit") { unsigned long b = strtoul(v.c_str(), nullptr, 0); if (b && b <= 0xFFFF) Q_RUN_BIT = (uint16_t)b; }
+        else if (k == "heat_warn_w")      g_wcfg.heat_warn_w      = clampf(x, 0.5f, 20.0f);
+        else if (k == "heat_warn_s")      g_wcfg.heat_warn_s      = clampf(x, 1.0f, 3600.0f);
+        else if (k == "temp_warn_c")      g_wcfg.temp_warn_c      = clampf(x, 30.0f, 69.0f);
+        else if (k == "health_log_s")     g_wcfg.health_log_s     = (int)clampf(x, 0, 86400);
         else PTZ_LOG("PTZ: %s: unknown key '%s' ignored\n", WATCH_CFG_PATH, k.c_str());
     }
     PTZ_LOG("PTZ: watch arrive %.1fdeg/%.0fs, drift %.1fdeg/%.1fs, correct %s (max %d, gap %.0fs), GetStatus position=%s, Q run bit 0x%04x%s\n",
             g_wcfg.arrive_tol_deg, g_wcfg.arrive_timeout_s, g_wcfg.drift_tol_deg, g_wcfg.drift_hold_s,
             g_wcfg.correct ? "on" : "off", g_wcfg.correct_max, g_wcfg.correct_gap_s,
             g_wcfg.status_real ? "measured" : "target", Q_RUN_BIT, f.is_open() ? "" : " (defaults)");
+    PTZ_LOG("PTZ: motor health (Q firmware only) heat warn %.1fW/%.0fs, temp warn %.0fC, log every %ds\n",
+            g_wcfg.heat_warn_w, g_wcfg.heat_warn_s, g_wcfg.temp_warn_c, g_wcfg.health_log_s);
 }
 
 static void watch_log_state(int ns, const char* why) {
@@ -960,6 +1032,7 @@ static bool watch_status(float& pan, float& tilt, bool& moving, std::string& err
         if (g_wstate == W_MOVING) moving = true;
         int s = g_wstate;
         err = (s == W_NOT_REACHED || s == W_DRIFT || s == W_MOTOR_OFF || s == W_NO_REPLY || s == W_CORRECTION_FAILED) ? W_NAME[s] : "";
+        if (s == W_MOTOR_OFF && (g_overheat[0].load() || g_overheat[1].load())) err = "MOTOR_OVERHEAT";
     }
     if (!g_wcfg.status_real) return false;
     uint64_t now = now_us();
@@ -1142,6 +1215,174 @@ static void arm_thread_func(bool cold, bool need0, bool need1) {
     finish_start(true);
 }
 
+// ===== 모터 헬스 (펌웨어 v2.4+ 의 Q: 추정 온도·발열·인가 전압·과열 트립) - docs/MOTOR_GUARD.md =====
+// 보드가 Vq 로 온도를 추정해 70 C 에서 스스로 끈다. 제작사 요청: 운영 중 온도·발열을 주기적으로 확인 ->
+// 특정 각도에서 발열이 계속 높으면 케이블 장력·기구 간섭 의심. 여기서는 기록·경보만 하고 모터 명령은 보내지 않는다
+// (트립 뒤 자동 S 없음: 원인이 그대로면 다시 트립).
+static const char* HEALTH_JSON_PATH = "/run/onvif_srvd/motor_health.json";
+static const uint64_t HEALTH_JSON_PERIOD_US = 1000000;    // 파일 1초
+static const uint64_t HEALTH_MQTT_PERIOD_US = 10000000;   // MQTT 10초
+static const uint64_t Q_FRESH_US = 3000000;               // 이보다 오래된 Q 는 무시
+
+struct AxisHealth {
+    bool     have = false;          // 이번 판정에 쓸 새 Q 가 있음
+    QRec     q;
+    uint16_t prev_flags = 0;
+    bool     prev_valid = false;
+    uint16_t prev_trips = 0;
+    uint64_t heat_since_us = 0;     // 발열 기준 초과가 시작된 시각
+    bool     heat_alerted = false;
+    bool     temp_alerted = false;
+    float    max_temp = -1000, max_heat = 0;  // 주기 기록 사이 최고값
+    float    max_heat_pan = 0, max_heat_tilt = 0;   // 그때 자세 (rad)
+};
+static AxisHealth g_mh[2];
+static std::mutex g_mh_mtx;
+
+static std::string q_flag_words(uint16_t f) {
+    std::string s;
+    if (f & QF_GUARD_TRIP)   s += " OVERHEAT-TRIP";
+    if (f & QF_COOLING)      s += " COOLING";
+    if (f & QF_DRIVER_FAULT) s += " DRIVER-FAULT";
+    return s;
+}
+
+// health 스레드에서 0.5초마다 (Q 조회 뒤). 상태가 바뀔 때만 로그
+static void motor_health_eval() {
+    if (!g_ax[0].has_q && !g_ax[1].has_q) return;
+    const float D = 57.29578f;
+    uint64_t now = now_us();
+    float pose[2] = { wrapd(g_tel[0].cur.load()), wrapd(g_tel[1].cur.load()) };
+    std::lock_guard<std::mutex> lk(g_mh_mtx);
+    for (int i = 0; i < 2; ++i) {
+        AxisHealth& h = g_mh[i];
+        h.have = false;
+        if (!g_ax[i].has_q) continue;
+        QRec q; uint64_t us;
+        if (!tel_last_q(i, q, us) || now - us > Q_FRESH_US || q.layout != 1) continue;
+        h.have = true; h.q = q;
+        const char* nm = g_ax[i].name;
+        g_overheat[i].store((q.flags & (QF_GUARD_TRIP | QF_COOLING)) != 0);
+
+        // 플래그 변화
+        uint16_t chg = h.prev_valid ? (uint16_t)(q.flags ^ h.prev_flags) : (uint16_t)(q.flags & (QF_GUARD_TRIP | QF_COOLING | QF_DRIVER_FAULT));
+        if ((chg & QF_GUARD_TRIP) && (q.flags & QF_GUARD_TRIP))
+            PTZ_LOG("PTZ-ALERT: %s motor OVERHEAT trip - estimate %.1f C (trip %.0f C), heat %.2f W, at pan %.1f tilt %.1f deg. "
+                    "Board turned the motor off and refuses S until it cools below 55 C (about 8 min). Not retrying - check for cable/obstruction\n",
+                    nm, q.temp, q.trip, q.heat, pose[0] * D, pose[1] * D);
+        if ((chg & QF_COOLING) && !(q.flags & QF_COOLING) && h.prev_valid)
+            PTZ_LOG("PTZ: %s motor cooled down (estimate %.1f C) - board accepts S again; restart onvif_srvd to re-arm\n", nm, q.temp);
+        if ((chg & QF_DRIVER_FAULT) && (q.flags & QF_DRIVER_FAULT))
+            PTZ_LOG("PTZ-ALERT: %s motor DRIVER FAULT flag set (estimate %.1f C, Vq %.2f V)\n", nm, q.temp, q.vq);
+        if ((chg & QF_DRIVER_FAULT) && !(q.flags & QF_DRIVER_FAULT) && h.prev_valid)
+            PTZ_LOG("PTZ: %s motor driver fault cleared\n", nm);
+        if (h.prev_valid && q.trips > h.prev_trips)
+            PTZ_LOG("PTZ-ALERT: %s overheat trips since board boot %u -> %u\n", nm, h.prev_trips, q.trips);
+        else if (!h.prev_valid && q.trips > 0)
+            PTZ_LOG("PTZ-ALERT: %s board reports %u overheat trip(s) since its boot (estimate now %.1f C)\n", nm, q.trips, q.temp);
+        h.prev_flags = q.flags; h.prev_trips = q.trips; h.prev_valid = true;
+
+        // 발열이 기준 이상으로 계속 (걸림·간섭 조기 경보)
+        if (q.heat >= g_wcfg.heat_warn_w) {
+            if (!h.heat_since_us) h.heat_since_us = now;
+            if (!h.heat_alerted && now - h.heat_since_us >= (uint64_t)(g_wcfg.heat_warn_s * 1e6f)) {
+                h.heat_alerted = true;
+                PTZ_LOG("PTZ-ALERT: %s motor heat %.2f W above %.1f W for %.0f s at pan %.1f tilt %.1f deg (estimate %.1f C, Vq %.2f/%.2f V) "
+                        "- possible cable tension or obstruction\n", nm, q.heat, g_wcfg.heat_warn_w, g_wcfg.heat_warn_s,
+                        pose[0] * D, pose[1] * D, q.temp, q.vq, q.vlim);
+            }
+        } else if (q.heat < g_wcfg.heat_warn_w * 0.8f) {   // 해제는 80% 아래 (기본 4.4 W) - 경계에서 깜빡임 방지
+            if (h.heat_alerted) PTZ_LOG("PTZ: %s motor heat back to normal (%.2f W, estimate %.1f C)\n", nm, q.heat, q.temp);
+            h.heat_since_us = 0; h.heat_alerted = false;
+        }
+        // 추정 온도
+        if (!h.temp_alerted && q.temp >= g_wcfg.temp_warn_c) {
+            h.temp_alerted = true;
+            PTZ_LOG("PTZ-ALERT: %s motor temperature estimate %.1f C above %.0f C (trip %.0f C), heat %.2f W at pan %.1f tilt %.1f deg\n",
+                    nm, q.temp, g_wcfg.temp_warn_c, q.trip, q.heat, pose[0] * D, pose[1] * D);
+        } else if (h.temp_alerted && q.temp < g_wcfg.temp_warn_c - 3.0f) {   // 해제는 3 C 아래
+            h.temp_alerted = false;
+            PTZ_LOG("PTZ: %s motor temperature back to normal (estimate %.1f C)\n", nm, q.temp);
+        }
+        // 주기 기록용 최고값
+        if (q.temp > h.max_temp) h.max_temp = q.temp;
+        if (q.heat >= h.max_heat) { h.max_heat = q.heat; h.max_heat_pan = pose[0]; h.max_heat_tilt = pose[1]; }
+    }
+
+    // 주기 기록 (그 사이 최고 온도·발열과 그때 자세)
+    static uint64_t last_log_us = 0;
+    if (g_wcfg.health_log_s > 0 && (!last_log_us || now - last_log_us >= (uint64_t)g_wcfg.health_log_s * 1000000ULL)) {
+        bool any = false;
+        std::string line = "PTZ-HEALTH:";
+        for (int i = 0; i < 2; ++i) {
+            AxisHealth& h = g_mh[i];
+            if (!h.have) continue;
+            char b[256];
+            snprintf(b, sizeof(b), " %s %.1fC %.2fW Vq %.2f/%.1fV trips %u (max %.1fC %.2fW at pan %.0f tilt %.0f)%s;",
+                     g_ax[i].name, h.q.temp, h.q.heat, h.q.vq, h.q.vlim, h.q.trips, h.max_temp, h.max_heat,
+                     h.max_heat_pan * D, h.max_heat_tilt * D, q_flag_words(h.q.flags).c_str());
+            line += b; any = true;
+            h.max_temp = -1000; h.max_heat = 0;
+        }
+        if (any) { line.back() = '\n'; PTZ_LOG("%s", line.c_str()); last_log_us = now; }
+    }
+}
+
+static std::string health_json_axis(int i) {
+    const AxisHealth& h = g_mh[i];
+    char b[512];
+    if (!h.have) { snprintf(b, sizeof(b), "\"%s\":null", g_ax[i].name); return b; }
+    const QRec& q = h.q;
+    snprintf(b, sizeof(b),
+        "\"%s\":{\"temp_c\":%.2f,\"heat_w\":%.2f,\"vq_v\":%.3f,\"vlim_v\":%.2f,\"room_c\":%.1f,\"trip_c\":%.1f,"
+        "\"trips\":%u,\"running\":%s,\"overheat_trip\":%s,\"cooling\":%s,\"driver_fault\":%s,\"flags\":%u,"
+        "\"heat_warn\":%s,\"temp_warn\":%s,\"foc_hz\":%u,\"board_uptime_s\":%u}",
+        g_ax[i].name, q.temp, q.heat, q.vq, q.vlim, q.room, q.trip, q.trips,
+        (q.flags & Q_RUN_BIT) ? "true" : "false", (q.flags & QF_GUARD_TRIP) ? "true" : "false",
+        (q.flags & QF_COOLING) ? "true" : "false", (q.flags & QF_DRIVER_FAULT) ? "true" : "false", q.flags,
+        h.heat_alerted ? "true" : "false", h.temp_alerted ? "true" : "false", q.foc_hz, q.up_ms / 1000);
+    return b;
+}
+
+// /run/onvif_srvd/motor_health.json (1초) + MQTT telemetry/<id>/ptz_health (10초). Q 펌웨어 축이 없으면 안 씀
+static void motor_health_publish() {
+    if (!g_ax[0].has_q && !g_ax[1].has_q) return;
+    static uint64_t last_file = 0, last_mqtt = 0;
+    uint64_t now = now_us();
+    bool do_file = now - last_file >= HEALTH_JSON_PERIOD_US, do_mqtt = g_mosq && now - last_mqtt >= HEALTH_MQTT_PERIOD_US;
+    if (!do_file && !do_mqtt) return;
+    std::string js;
+    {
+        std::lock_guard<std::mutex> lk(g_mh_mtx);
+        if (!g_mh[0].have && !g_mh[1].have) return;
+        js = "{" + health_json_axis(0) + "," + health_json_axis(1) + ",\"ts\":" + std::to_string((long)time(NULL)) + "}";
+    }
+    if (do_file) {
+        last_file = now;
+        std::string tmp = std::string(HEALTH_JSON_PATH) + ".tmp";
+        { std::ofstream f(tmp, std::ios::trunc); if (f.is_open()) f << js << "\n"; }
+        chmod(tmp.c_str(), 0644);
+        rename(tmp.c_str(), HEALTH_JSON_PATH);
+    }
+    if (do_mqtt && g_mqtt_topic[0]) {
+        last_mqtt = now;
+        std::string topic = std::string(g_mqtt_topic) + "_health";
+        mosquitto_publish(g_mosq, NULL, topic.c_str(), (int)js.size(), js.c_str(), 0, false);
+    }
+}
+
+// live 파일용 한 줄 (축별)
+static std::string health_live_line(int i) {
+    std::lock_guard<std::mutex> lk(g_mh_mtx);
+    const AxisHealth& h = g_mh[i];
+    if (!g_ax[i].has_q || !h.have) return "";
+    char b[256];
+    snprintf(b, sizeof(b), "%-5s  motor %5.1f C (trip %.0f)  heat %5.2f W  Vq %5.2f/%.1f V  trips %u%s%s%s\n",
+             g_ax[i].name, h.q.temp, h.q.trip, h.q.heat, h.q.vq, h.q.vlim, h.q.trips, q_flag_words(h.q.flags).c_str(),
+             h.heat_alerted ? " HEAT-WARN" : "", h.temp_alerted ? " TEMP-WARN" : "");
+    return b;
+}
+
 // 실시간 상태 파일 (/run/onvif_srvd/live). --mcu-info와 `watch -n1 cat`으로 본다.
 static const char* LIVE_STATE_STR[] = { "normal", "motor OFF", "not holding target", "no reply" };
 static void write_live(const bool ok[2], const float t[2], const float c[2], const float o[2],
@@ -1161,6 +1402,7 @@ static void write_live(const bool ok[2], const float t[2], const float c[2], con
                      (st[i] >= 0 && st[i] <= 3) ? LIVE_STATE_STR[st[i]] : "?");
             f << b;
         }
+        for (int i = 0; i < 2; ++i) f << health_live_line(i);
         f << watch_line();
     }
     chmod(tmp.c_str(), 0644);
@@ -1223,6 +1465,8 @@ static void health_thread_func() {
             }
         }
         watch_eval(ok, ca, offa);
+        motor_health_eval();
+        motor_health_publish();
         write_live(ok, ta, ca, oa, sta, moving);
     }
 }

@@ -21,7 +21,8 @@
 
 | 파일 | 내용 |
 |---|---|
-| `live` | 실시간 각도 — 0.5초마다 MCU 에 `T` 조회 (pan/tilt 현재·목표·offset·상태) |
+| `live` | 실시간 각도 — 0.5초마다 MCU 에 `T` 조회 (pan/tilt 현재·목표·offset·상태). Q 펌웨어(v2.4+)는 축별 모터 헬스 줄 추가 (추정 온도·발열·Vq·트립) |
+| `motor_health.json` | Q 펌웨어(v2.4+)만. 축별 추정 온도·발열·Vq·전압 한계·트립 횟수·과열/냉각/드라이버 오류 플래그, 1초마다 ([MOTOR_GUARD.md](MOTOR_GUARD.md)). 같은 내용을 MQTT `telemetry/<id>/ptz_health` 로 10초마다 |
 | `mcu_info` | 시작 때 기록 — 펌웨어 버전, 기동 상태, 보낸 조치, 펌웨어 한계, `I` 출력 |
 | `started` | 이번 부팅에 onvif 가 한 번 시작했다는 표식 (콜드부팅 첫 시작 판별용) |
 
@@ -58,6 +59,8 @@ sudo fuser -v /dev/ttyAMA0 /dev/ttyAMA2
 | `PTZ: arrived ...` / `PTZ-ALERT: NOT_REACHED·DRIFT·CORRECTION_FAILED` | 이동 감시 결과 ([PTZ_STREAMING.md](PTZ_STREAMING.md)), 바뀔 때만 |
 | `ONVIF-AUTH: allowed <요청> from <IP> (digest/text)` | 밖에서 계정 확인 통과 (같은 IP·결과는 30초에 한 번) ([WSSE.md](WSSE.md)) |
 | `ONVIF-AUTH: DENIED <요청> from <IP> (<이유>)` | `no-credentials` 계정 없음 · `wrong-password` · `wrong-user` · `locked-now`/`locked` 5번 틀려 60초 잠김 · `digest-needs-password-file` 원문 파일 없음(웹 비밀번호 다시 저장) · `no-device-id` |
+| `PTZ-HEALTH:` | Q 펌웨어만. 5분마다 축별 추정 온도·발열·Vq·트립 + 그 사이 최고 온도·발열과 그때 자세 ([MOTOR_GUARD.md](MOTOR_GUARD.md)) |
+| `PTZ-ALERT: ... motor OVERHEAT trip` / `heat ... above` / `temperature estimate ... above` / `board says: Guard: ...` | 과열 트립, 발열 기준(5.5 W) 30초 이상, 추정 온도 60 °C 이상, 보드 과열 알림. 트립 때 GetStatus Error = `MOTOR_OVERHEAT`. **자동 재시작 없음** |
 | `PTZ: zoom camera ...` | 줌카메라 주소·계정 출처(`account from ...`), 조회 `OK` / `OK again` (실패는 `PTZ-ALERT`, 끊길 때 한 번) |
 
 ## 장비 시험 도구 (`/home/ptz/workspace/onvif_setup`)

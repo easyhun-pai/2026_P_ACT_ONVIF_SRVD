@@ -170,8 +170,16 @@ dispatcher 를 `try-restart` + IP 비교로 수정 ([INCIDENT-261027](incidents/
   token 띄어쓰기는 `_`, 이름 줄바꿈·탭은 공백
 - ptz018 시험: `onvif_preset_name_test.py` 25건 + 계정 시험(43·17·장비 안) 다시 PASS. **v1.0 = 빌드 `8a8bc609`**
 
+### 11-10 · 모터 헬스 → v1.1.0 (`a8e37f1f`, 브랜치 `feat/motor-health`)
+- 제작사 안내: 모터 펌웨어 v2.4+ 는 Vq 로 모터 온도를 추정해 70 °C 에서 스스로 끈다 (55 °C 아래까지 S 거부, 약 8분). 운영 중 온도·발열 확인 요청
+- 0.5초 감시에서 Q 전체 해석 → live·`/run/onvif_srvd/motor_health.json`·MQTT `<topic>_health`·`PTZ-HEALTH` 5분 로그(구간 최고 발열과 그때 자세)·
+  경보(트립, 드라이버 오류, 발열 5.5 W 30초, 60 °C), GetStatus `MOTOR_OVERHEAT`. 모터 명령 추가 없음, 자동 재시작 없음 — [MOTOR_GUARD.md](MOTOR_GUARD.md)
+- poe002(v2.5.1) 시험: 출력·경보·전 범위, 시험 중 해제 기준 버그 1건 수정. ptz018(Pro) 회귀 14/14
+- 실측: poe002 팬 양 끝(±126°) 정지 발열 2~4 W (가운데 0.02 W) — 케이블 장력 추정
+- 버전 이름을 3자리로 (edge 와 같은 형식): main 태그 `v1.0` → `v1.0.0`
+
 ### 남은 일
-- [ ] edge onvif-deps.tar.gz 에 v1.0(`8a8bc609`) + edge 패치(`deploy/edge_onvif_auth_patch.py`) 반영
+- [ ] edge onvif-deps.tar.gz 에 v1.0.0(`8a8bc609`) + edge 패치(`deploy/edge_onvif_auth_patch.py`) 반영
 - [ ] 모터 펌웨어 v2.5.1 실장비에서 Q 켜짐 비트 확인 (라이다는 Debian 13 에서 빌드)
 - [ ] 줌카메라 비밀번호 교체 검토 (예전 소스 이력·07-28 공개 패키지에 남아 있음)
 - [ ] 콜드부팅 후 처진 자세 유지가 맞는지, 30초 대기가 적절한지 확인 (확인 필요)

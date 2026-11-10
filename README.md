@@ -13,7 +13,8 @@ P-ACT(MK3) PTZ 카메라의 ONVIF 서버 `onvif_srvd` 개조본 — ONVIF PTZ �
 
 | 버전 | 날짜 | 바이너리 md5 | 내용 |
 |---|---|---|---|
-| **v1.0** | 2026-11-05 | `8a8bc609` | mk3-basic + 줌 위치 + 이동 감시(스트리밍 모드) + v2.4+ 펌웨어 기동 판정 + **ONVIF 계정 확인** (admin + 웹 비밀번호, edge 패치 같이 — [WSSE.md](docs/WSSE.md)) + 프리셋 이름 띄어쓰기·한글 |
+| **v1.1.0** | 2026-11-10 | `a8e37f1f` | v1.0.0 + **모터 헬스**: 라이다 모터(펌웨어 v2.4+) 추정 온도·발열·과열 트립 기록·경보, `motor_health.json`, GetStatus `MOTOR_OVERHEAT` ([MOTOR_GUARD.md](docs/MOTOR_GUARD.md)). Pro(구형 펌웨어)는 동작 같음 |
+| **v1.0.0** | 2026-11-05 | `8a8bc609` | mk3-basic + 줌 위치 + 이동 감시(스트리밍 모드) + v2.4+ 펌웨어 기동 판정 + **ONVIF 계정 확인** (admin + 웹 비밀번호, edge 패치 같이 — [WSSE.md](docs/WSSE.md)) + 프리셋 이름 띄어쓰기·한글 |
 
 SW 버전 확인 (장비에서): `md5sum $(which onvif_srvd) | cut -c1-8` · 빌드 이름: `onvif_srvd --version`
 이전 빌드·정리한 브랜치 기록: [docs/VERSIONS.md](docs/VERSIONS.md)
@@ -48,7 +49,7 @@ SW 버전 확인 (장비에서): `md5sum $(which onvif_srvd) | cut -c1-8` · 빌
 | `tools/onvif_setup/` | **장비 시험 도구** — 카메라 화면 확인(PC 브라우저), ONVIF 팬/틸트 시험, 한 줄 이동, 줌 위치·이동 감시·계정 헤더 시험 |
 | `tools/make_package.py` | 배포 묶음(zip) 만들기 |
 | `tools/pantilt.py` 외 | 시리얼 직접 제어 도구 (onvif 를 멈춘 뒤 사용) |
-| `docs/` | [HARDWARE](docs/HARDWARE.md)(★ 코드 만지기 전 필독) · [PTZ_STREAMING](docs/PTZ_STREAMING.md) · [WSSE](docs/WSSE.md) · [VERSIONS](docs/VERSIONS.md) · [BUILD](docs/BUILD.md) · [DEPLOY](docs/DEPLOY.md) · [OPERATIONS](docs/OPERATIONS.md) · [HISTORY](docs/HISTORY.md) · [incidents/](docs/incidents/) |
+| `docs/` | [HARDWARE](docs/HARDWARE.md)(★ 코드 만지기 전 필독) · [PTZ_STREAMING](docs/PTZ_STREAMING.md) · [WSSE](docs/WSSE.md) · [MOTOR_GUARD](docs/MOTOR_GUARD.md)(라이다 모터 과열 보호) · [VERSIONS](docs/VERSIONS.md) · [BUILD](docs/BUILD.md) · [DEPLOY](docs/DEPLOY.md) · [OPERATIONS](docs/OPERATIONS.md) · [HISTORY](docs/HISTORY.md) · [incidents/](docs/incidents/) |
 
 ## 실행·배포
 
