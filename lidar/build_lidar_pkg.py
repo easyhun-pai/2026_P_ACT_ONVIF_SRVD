@@ -41,6 +41,15 @@ def patch(name, data):
                        'def start_pipeline() -> tuple[bool, str]:\n'
                        '    if IS_LIDAR:\n        return False, "라이다 모델은 AI(광각) 파이프라인을 지원하지 않습니다"\n', 1)
         assert t2 != t; t = t2
+        # 라이다: my_camera 는 줌 RTSP -> 광각(rpiCamera*) 값 PATCH 는 경로를 닫았다 열어 영상·녹화를 끊는다 (QA 11-16 #3).
+        # 모든 호출(장착 모드 flip, PUT /api/settings, reset, 시작 시 적용)이 지나는 _mtx_patch_path 에서 거른다.
+        a = 'def _mtx_patch_path(patch: dict, what: str = "") -> tuple[bool, str]:\n'
+        i = t.index(a); j = t.index("    try:\n", i)
+        t = t[:j] + ("    if IS_LIDAR:\n"
+                     "        patch = {k: v for k, v in patch.items() if not k.startswith(\"rpiCamera\") and not (k == \"source\" and v == \"rpiCamera\")}\n"
+                     "        if not patch:\n"
+                     "            logger.info(\"라이다: 광각(rpiCamera) 설정은 적용하지 않음%s (줌 영상 유지)\", what)\n"
+                     "            return True, \"unchanged\"\n") + t[j:]
         # 모듈 맨 앞 import 뒤에 모델 판정
         t2 = re.sub(r"(\nimport os\n)", r"\1IS_LIDAR = os.path.exists('/etc/pact-model') and open('/etc/pact-model').read().strip() == 'lidar'\n", t, count=1)
         assert t2 != t, "import os not found"; t = t2

@@ -31,12 +31,13 @@ From a PC, install everything in one go: `python deploy_bundle.py <IP> --zip bui
 | Kiosk (HDMI lock) | Installed | Skipped by default. `KIOSK=1` installs it |
 | Python packages | pip | **apt** (Debian 13 blocks pip) |
 | selfcheck | Checks eth1 and Hailo | Checks br-sensor; skips Hailo |
+| Wide camera settings (rpiCamera*) | Applied to my_camera | **Not applied.** On the Lidar, flipping the mount mode or saving or resetting settings would otherwise close and reopen the zoom video and cut the recording. The zoom camera's own flip still works |
 
 The edge files are patched as follows:
 - `/home/ptz` becomes `/home/poe`.
 - The services run as poe (edge-whep-bridge, updater, platform_mqtt group).
 - In the mediamtx template, my_camera becomes the zoom camera RTSP stream.
-- In settings_handler, rpiCamera restore and AI start are disabled.
+- In settings_handler, rpiCamera restore and AI start are disabled, and `_mtx_patch_path` drops wide-camera values.
 - In selfcheck, the checks follow the Lidar layout.
 
 ## Notes
