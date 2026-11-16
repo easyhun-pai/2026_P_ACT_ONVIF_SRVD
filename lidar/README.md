@@ -45,6 +45,10 @@ The edge files are patched as follows:
 - **Mount mode** (stand or hang, set from the web UI or the platform) flips the sign of the ONVIF tilt. In hang mode, tilt values are negative (0 to −1.48).
 - **The tilt firmware range differs per unit** (for example 0 to 1.48, or 0.05 to 1.49). ONVIF uses the range it reads from the motor board.
 - **External RTSP** works as on the Pro: it needs admin and the video password. Connections from inside the device are allowed.
+- **ONVIF account check:** onvif_srvd v1.1.0 only reads the web password hash from `/home/ptz/edge/.device_auth`. On the Lidar the file is in `/home/poe/edge`, so the installer adds a link at `/home/ptz/edge/.device_auth`; the rollback removes it.
+  - Without this link, ODM and NVRs can log in only with the initial password (the serial) even after the web password is changed.
+  - The video (RTSP) then returns 401. After 5 failures, that PC's IP is locked for 60 seconds, so the web preview from the same PC is blocked too.
+  - This was fixed on 2026-11-16, and the onvif source will read both paths in a later release.
 
 ## Roll back to the vendor shipping state
 
@@ -59,7 +63,7 @@ On the PC, run `python rollback.py <IP>`. It compares the device with the pre-in
 | `motor_check_dev.py` | Runs on the device. Only V/I/E/Q/S/T, no commands that change settings |
 | `onvif_function_test.py` | Runs on the device. Covers move status, continuous move, presets with Korean names, end-to-end heat over 3 round trips, and GetStatus Error |
 
-Accounts come from the `LIDAR_USER` and `LIDAR_PASS` environment variables. Results go to `./data/` (`LIDAR_DATA`), which is not committed.
+Accounts come from the `LIDAR_USER` and `LIDAR_PASS` environment variables. Results go to `./data/` (`LIDAR_DATA`), which is not committed. If you change the web password and set `LIDAR_WEB_PASS`, `lidar_edge_test.py` also checks the ONVIF login (admin + web password) and external RTSP with authentication.
 
 ## Verified (2026-11-16)
 

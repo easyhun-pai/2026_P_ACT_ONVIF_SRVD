@@ -19,6 +19,23 @@ D = os.path.join(os.environ.get("LIDAR_DATA", os.path.join(os.getcwd(), "data"))
 up = float(sh("cut -d' ' -f1 /proc/uptime"))
 if up < 150: print(f"부팅 {up:.0f}s - 서비스 안정 대기", flush=True); time.sleep(150 - up)
 R = []; raw = {}
+ONVIF_LOGIN = r'''import base64, hashlib, os, datetime, sys, urllib.request as U
+# 장비 안에서: python3 onvif_login.py <비밀번호파일>  -> ONVIF GetDeviceInformation (admin, PasswordDigest)
+pw = open(sys.argv[1]).read().strip()
+n = os.urandom(16); c = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+d = base64.b64encode(hashlib.sha1(n + c.encode() + pw.encode()).digest()).decode()
+sec = ('<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" '
+       'xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><wsse:UsernameToken>'
+       '<wsse:Username>admin</wsse:Username><wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
+       + d + '</wsse:Password><wsse:Nonce>' + base64.b64encode(n).decode() + '</wsse:Nonce><wsu:Created>' + c + '</wsu:Created></wsse:UsernameToken></wsse:Security>')
+e = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Header>' + sec +
+     '</s:Header><s:Body><GetDeviceInformation xmlns="http://www.onvif.org/ver10/device/wsdl"/></s:Body></s:Envelope>')
+try:
+    r = U.urlopen(U.Request('http://127.0.0.1:1000/onvif/device_service', e.encode(), {'Content-Type': 'application/soap+xml'}), timeout=5).read().decode()
+    print('LOGIN', 'OK' if 'Manufacturer' in r else 'FAULT')
+except Exception as ex:
+    print('LOGIN ERR', getattr(ex, 'code', ex))
+'''
 def res(k, ok, d): R.append((k, "O" if ok is True else ("X" if ok is False else ok), d)); print(f"{R[-1][1]} {k:<24} {d}", flush=True)
 SV = "edge-device-id mediamtx edge-settings edge-ptz edge-healthcheck edge-whep-bridge onvif_srvd wsdd redis-server".split()
 st = dict(zip(SV, sh("systemctl is-active " + " ".join(SV)).split()))
@@ -36,7 +53,19 @@ for p in ("my_camera", "detection_zoom"):
     fr = int((re.search(r"frame=\s*(\d+)", o) or [0, 0])[1]); raw[p] = o
     res(f"영상 {p}", fr >= 50, f"{o.strip().splitlines()[0] if o.strip() else '-'} / 5초 {fr} frames")
 o = sh(f"timeout 15 ffprobe -v error -rtsp_transport tcp -show_entries stream=codec_name,width,height -of csv=p=0 rtsp://{ip}:8554/my_camera 2>&1"); raw["ext"] = o
-res("영상 외부 주소 (ONVIF 주소)", "h264" in o or "hevc" in o, f"rtsp://{ip}:8554/my_camera -> {o.strip()[:60]}")
+res("영상 외부 인증 없이 (401 이어야)", "401" in o, f"rtsp://{ip}:8554/my_camera -> {o.strip()[:60]}")
+WEBPW = os.environ.get("LIDAR_WEB_PASS")   # 웹에서 바꾼 비밀번호 (없으면 이 두 항목 건너뜀)
+if WEBPW:
+    import base64 as _b, urllib.parse as _q
+    sf0 = c.open_sftp(); sf0.putfo(io.BytesIO(WEBPW.encode()), "/tmp/.wp"); sh("chmod 600 /tmp/.wp")
+    sf0.putfo(io.BytesIO(ONVIF_LOGIN.encode()), "/tmp/onvif_login.py")
+    lo = sh("python3 /tmp/onvif_login.py /tmp/.wp 2>/dev/null")
+    res("ONVIF 로그인 (admin + 웹 비밀번호)", "LOGIN OK" in lo, lo.strip()[:60])
+    o2 = sh(f"timeout 15 ffprobe -v error -rtsp_transport tcp -show_entries stream=codec_name,width,height -of csv=p=0 "
+            f"\"rtsp://admin:$(python3 -c 'import urllib.parse;print(urllib.parse.quote(open(\"/tmp/.wp\").read().strip(),safe=\"\"))')@{ip}:8554/my_camera\" 2>&1; rm -f /tmp/.wp")
+    res("영상 외부 (admin + 웹 비밀번호)", "h264" in o2 or "hevc" in o2, o2.strip()[:60])
+else:
+    res("ONVIF 로그인·외부 영상 (웹 비밀번호)", "건너뜀", "LIDAR_WEB_PASS 없음")
 sc = sh("cd ~/edge && timeout 120 python3 selfcheck.py 2>&1", 150); raw["selfcheck"] = sc
 m = re.search(r"ok\D*(\d+).*?warn\D*(\d+).*?fail\D*(\d+)", sc.replace("\n", " "), re.S)
 fails = [l.strip() for l in sc.splitlines() if re.search(r"\bfail\b|\[FAIL\]|✗|X ", l)][:8]

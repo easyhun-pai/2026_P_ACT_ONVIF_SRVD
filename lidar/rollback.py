@@ -37,6 +37,7 @@ rm -rf {FILES}
 {'' if mosq_owned else 'rm -f /lib/aarch64-linux-gnu/libmosquitto.so.1'}
 {('DEBIAN_FRONTEND=noninteractive apt-get purge -y ' + ' '.join(new_pk)) if new_pk else 'true'}
 {('sudo -u poe pip3 uninstall -y --break-system-packages ' + ' '.join(new_pip)) if new_pip else 'true'}
+if ! id ptz >/dev/null 2>&1; then rm -f /home/ptz/edge/.device_auth; rmdir /home/ptz/edge /home/ptz 2>/dev/null; fi
 systemctl daemon-reload; ldconfig; systemctl restart systemd-journald
 """
 print(script)

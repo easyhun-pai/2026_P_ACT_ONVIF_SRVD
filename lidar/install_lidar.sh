@@ -296,6 +296,13 @@ log_info "ONVIF 의존성 설치"
 sudo tar -xzf "$TMP_DIR/onvif-deps.tar.gz" -C / --no-same-owner
 sudo chmod +x /usr/local/bin/onvif_srvd /usr/local/bin/wsdd 2>/dev/null || true
 sudo ldconfig
+if [ "$EDGE_MODEL" = "lidar" ]; then
+    # onvif_srvd v1.1.0 은 웹 비밀번호 해시를 /home/ptz/edge/.device_auth 에서만 읽는다 (없으면 초기값=시리얼로만 로그인).
+    # 라이다는 /home/poe/edge -> 링크. (2026-11-16 실장비: 웹 비밀번호 바꿔도 ODM 은 시리얼로만 로그인, 영상 401)
+    sudo mkdir -p /home/ptz/edge
+    sudo ln -sfn "$EDGE_DIR/.device_auth" /home/ptz/edge/.device_auth
+    log_info "  ONVIF 계정 확인 경로: /home/ptz/edge/.device_auth -> $EDGE_DIR/.device_auth"
+fi
 
 # IP 변경(DHCP 갱신 / 재연결) 시 onvif_srvd + wsdd 가 새 IP로 재시작되도록 훅 설치
 NM_HOOK_DIR="/etc/NetworkManager/dispatcher.d"
