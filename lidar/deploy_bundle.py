@@ -27,12 +27,12 @@ print(host, "first install" if first else "upgrade", flush=True)
 c.open_sftp().put(ZIP, "/home/poe/edge_v1.0.1-lidar.zip")
 sh("cd ~ && rm -rf edge_v1.0.1-lidar && python3 -m zipfile -e edge_v1.0.1-lidar.zip . && rm -f edge_v1.0.1-lidar.zip")
 sh(S + "sh -c \"echo 'poe ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-edge-install && chmod 440 /etc/sudoers.d/99-edge-install\"")
-_, o, _ = c.exec_command("cd ~/edge_v1.0.1-lidar && setsid nohup bash install_lidar.sh </dev/null >/tmp/install_lidar.log 2>&1 & echo started", timeout=20); o.read()
+ch = c.get_transport().open_session(); ch.exec_command("cd ~/edge_v1.0.1-lidar && setsid nohup bash install_lidar.sh </dev/null >/tmp/install_lidar.log 2>&1 &"); time.sleep(3); ch.close()   # 출력 안 읽음 (nohup 이 채널을 잡아 막힘)
 t = time.time()
 while time.time() - t < 1500:
     time.sleep(10)
     try:
-        if sh("pgrep -f '^bash install_lidar.sh' >/dev/null && echo RUN || echo DONE").strip() == "DONE": break
+        if "RUN" not in sh("ps -eo args | grep -q '^bash install_lidar.sh' && echo RUN || echo DONE"): break
     except Exception:
         time.sleep(5); c = conn()
 lg = sh("sed 's/\x1b\[[0-9;]*m//g' /tmp/install_lidar.log")
